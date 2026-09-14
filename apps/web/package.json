@@ -1,0 +1,33 @@
+{
+  "name": "lakehouse-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@payloadcms/db-postgres": "^3.0.0",
+    "@payloadcms/next": "^3.0.0",
+    "@payloadcms/richtext-lexical": "^3.0.0",
+    "@payloadcms/ui": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-sts": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0",
+    "duckdb": "^1.0.0",
+    "next": "15.1.0",
+    "payload": "^3.0.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "lucide-react": "^0.460.0",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.5.0"
+  }
+}
