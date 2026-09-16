@@ -94,13 +94,28 @@ export async function POST(req: NextRequest) {
       limit: 1,
     })
 
+    // Auto-extract dependencies from query if not provided
+    let finalDeps = Array.isArray(dependencies) && dependencies.length > 0 ? [...dependencies] : []
+    if (finalDeps.length === 0 && query) {
+      const matches = query.matchAll(/\b(?:FROM|JOIN)\s+([a-zA-Z0-9_.]+)/gi)
+      const extracted = new Set<string>()
+      for (const m of matches) {
+        const rawTable = m[1].replace(/["`]/g, '')
+        const clean = rawTable.replace(`${tenant_id}_silver.`, '').replace(`${tenant_id}_gold.`, '').replace(`${tenant_id}_`, '')
+        if (clean && clean !== cleanName) {
+          extracted.add(clean)
+        }
+      }
+      finalDeps = Array.from(extracted)
+    }
+
     const datasetData = {
       name: cleanName,
       tenant: tenantDocId,
       layer: 'gold' as const,
       objectType: (action === 'materialize' ? 'table' : 'view') as 'table' | 'view',
       sqlQuery: query,
-      dependencies,
+      dependencies: finalDeps,
       format: (action === 'materialize' ? 'parquet' : 'sql_view') as 'parquet' | 'sql_view',
       status: 'completed' as const,
       ducklakeTable: `${tenant_id}_gold.${cleanName}`,
@@ -133,6 +148,7 @@ export async function POST(req: NextRequest) {
       object_type: action === 'materialize' ? 'table' : 'view',
       columns: workerData.columns || [],
       row_count: workerData.row_count,
+      dependencies: finalDeps,
       message:
         action === 'materialize'
           ? `Materialized Gold table '${cleanName}' created with Parquet storage.`
@@ -144,5 +160,105 @@ export async function POST(req: NextRequest) {
       { error: err.message || 'Failed to create Gold object' },
       { status: 500 }
     )
+  }
+}
+
+export async function GET(req: NextRequest) {
+  try {
+    const { searchParams } = new URL(req.url)
+    const tenantId = searchParams.get('tenant_id') || 'tenant_acme'
+
+    const payload = await getPayload({ config: configPromise })
+
+    // Find tenant
+    const tenants = await payload.find({
+      collection: 'tenants',
+      where: { slug: { equals: tenantId } },
+      limit: 1,
+    })
+
+    const tenantDocId = tenants.docs[0]?.id
+
+    // Find Gold datasets for this tenant
+    const datasets = await payload.find({
+      collection: 'datasets',
+      where: {
+        and: [
+          tenantDocId ? { tenant: { equals: tenantDocId } } : { id: { exists: true } },
+          { layer: { equals: 'gold' } },
+        ],
+      },
+      sort: '-updatedAt',
+      limit: 100,
+    })
+
+    // Also fetch tables from worker to verify DuckDB schema / catch any direct tables
+    const workerUrl = process.env.WORKER_URL || 'http://worker:8000'
+    let workerGoldTables: any[] = []
+    try {
+      const res = await fetch(`${workerUrl}/api/v1/tables?tenant_id=${encodeURIComponent(tenantId)}`)
+      if (res.ok) {
+        const tData = await res.json()
+        workerGoldTables = (tData.tables || []).filter((t: any) => t.layer === 'gold')
+      }
+    } catch (e) {
+      console.warn('Worker tables fetch error in GET /api/gold:', e)
+    }
+
+    const goldObjects = datasets.docs.map((doc: any) => {
+      let deps: string[] = Array.isArray(doc.dependencies) ? doc.dependencies : []
+      if (deps.length === 0 && doc.sqlQuery) {
+        const matches = doc.sqlQuery.matchAll(/\b(?:FROM|JOIN)\s+([a-zA-Z0-9_.]+)/gi)
+        const extracted = new Set<string>()
+        for (const m of matches) {
+          const rawTable = m[1].replace(/["`]/g, '')
+          const clean = rawTable.replace(`${tenantId}_silver.`, '').replace(`${tenantId}_gold.`, '').replace(`${tenantId}_`, '')
+          if (clean && clean !== doc.name) {
+            extracted.add(clean)
+          }
+        }
+        deps = Array.from(extracted)
+      }
+
+      return {
+        id: String(doc.id),
+        name: doc.name,
+        full_name: doc.ducklakeTable || `${tenantId}_gold.${doc.name}`,
+        layer: 'gold',
+        objectType: (doc.objectType || (doc.format === 'parquet' ? 'table' : 'view')) as 'view' | 'table',
+        sqlQuery: doc.sqlQuery || `CREATE VIEW ${tenantId}_gold.${doc.name} AS SELECT * FROM ${tenantId}_silver.${doc.name};`,
+        dependencies: deps,
+        rowCount: doc.rowCount ?? null,
+        updatedAt: doc.updatedAt || doc.createdAt || null,
+        createdAt: doc.createdAt || null,
+      }
+    })
+
+    // Add any worker gold tables not already in payload docs
+    for (const wt of workerGoldTables) {
+      if (!goldObjects.some((g: any) => g.name === wt.name)) {
+        goldObjects.push({
+          id: `worker-${wt.name}`,
+          name: wt.name,
+          full_name: wt.full_name,
+          layer: 'gold',
+          objectType: (wt.type || 'view') as 'view' | 'table',
+          sqlQuery: `SELECT * FROM ${wt.full_name};`,
+          dependencies: [],
+          rowCount: null,
+          updatedAt: null,
+          createdAt: null,
+        })
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      tenant_id: tenantId,
+      gold_objects: goldObjects,
+    })
+  } catch (err: any) {
+    console.error('Error fetching gold objects:', err)
+    return NextResponse.json({ error: err.message }, { status: 500 })
   }
 }

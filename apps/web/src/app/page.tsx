@@ -68,6 +68,19 @@ interface TenantInfo {
   datasetCount?: number
 }
 
+interface GoldObject {
+  id: string
+  name: string
+  full_name: string
+  layer: 'gold'
+  objectType: 'view' | 'table'
+  sqlQuery: string
+  dependencies: string[]
+  rowCount?: number | null
+  updatedAt?: string | null
+  createdAt?: string | null
+}
+
 function getTypeBadge(type: string, colName: string = '') {
   const t = (type || '').toLowerCase()
   const name = colName.toLowerCase()
@@ -326,8 +339,11 @@ function lintSQL(sql: string, tenantId: string): LintIssue[] {
 }
 
 export default function LakehouseStudio() {
-  // Navigation: 'sql' | 'ingestion' | 'catalogs' | 'views'
-  const [activeScreen, setActiveScreen] = useState<'sql' | 'ingestion' | 'catalogs' | 'views'>('sql')
+  // Navigation: 'sql' | 'ingestion' | 'views'
+  const [activeScreen, setActiveScreen] = useState<'sql' | 'ingestion' | 'views'>('sql')
+
+  // User Role (Section 2.3: Hide slug for tenant_user and tenant_admin, show for platform_admin)
+  const [userRole, setUserRole] = useState<'platform_admin' | 'tenant_admin' | 'tenant_user'>('tenant_admin')
 
   // Workspace / Tenant Scope
   const [tenantId, setTenantId] = useState('tenant_acme')
@@ -405,6 +421,11 @@ export default function LakehouseStudio() {
   const [goldLoading, setGoldLoading] = useState(false)
   const [goldStatusMsg, setGoldStatusMsg] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const [copiedResults, setCopiedResults] = useState(false)
+
+  // Views / Gold Objects State (Section 4)
+  const [goldObjects, setGoldObjects] = useState<GoldObject[]>([])
+  const [isGoldLoading, setIsGoldLoading] = useState(false)
+  const [expandedGoldObjects, setExpandedGoldObjects] = useState<Record<string, boolean>>({})
 
   // Dataset Delete Confirmation State
   const [deleteModalOpen, setDeleteModalOpen] = useState(false)
@@ -552,6 +573,7 @@ export default function LakehouseStudio() {
       })
       fetchTables(tenantId)
       fetchJobs(tenantId)
+      fetchGoldObjects(tenantId)
       setTimeout(() => {
         setGoldModalOpen(false)
         setGoldStatusMsg(null)
@@ -596,6 +618,7 @@ export default function LakehouseStudio() {
       setDeletingItem(null)
       fetchTables(tenantId)
       fetchJobs(tenantId)
+      fetchGoldObjects(tenantId)
     } catch (err: any) {
       alert(`Deletion error: ${err.message}`)
     } finally {
@@ -635,6 +658,22 @@ export default function LakehouseStudio() {
       }
     } catch (err) {
       console.error('Failed to fetch jobs:', err)
+    }
+  }
+
+  // Load tenant Gold views and materialized tables (Section 4)
+  const fetchGoldObjects = async (tid = tenantId) => {
+    try {
+      setIsGoldLoading(true)
+      const res = await fetch(`/api/gold?tenant_id=${encodeURIComponent(tid)}`)
+      if (res.ok) {
+        const data = await res.json()
+        setGoldObjects(data.gold_objects || [])
+      }
+    } catch (err) {
+      console.error('Failed to fetch gold objects:', err)
+    } finally {
+      setIsGoldLoading(false)
     }
   }
 
@@ -709,11 +748,12 @@ export default function LakehouseStudio() {
     status: 'active',
   }
 
-  // Reload tables and jobs when tenant or tab changes
+  // Reload tables, jobs, and views when tenant, tab, or screen changes
   useEffect(() => {
     fetchTables(tenantId)
     fetchJobs(tenantId)
-  }, [tenantId, activeTab])
+    fetchGoldObjects(tenantId)
+  }, [tenantId, activeTab, activeScreen])
 
   // Polling for job updates if any active job
   useEffect(() => {
@@ -1302,6 +1342,7 @@ export default function LakehouseStudio() {
   const paginatedRows = queryResult?.rows.slice((currentPage - 1) * pageSize, currentPage * pageSize) || []
   const startRowIndex = totalRows === 0 ? 0 : (currentPage - 1) * pageSize + 1
   const endRowIndex = Math.min(totalRows, currentPage * pageSize)
+  const hasQueryExecuted = Boolean(queryResult || queryError)
 
   // Line count for SQL editor gutter
   const lineCount = Math.max(10, currentQuery.split('\n').length)
@@ -1333,7 +1374,9 @@ export default function LakehouseStudio() {
             >
               <span className="material-symbols-outlined text-[15px] text-zinc-400">domain</span>
               <span className="font-semibold text-zinc-200">{currentTenant.name}</span>
-              <span className="text-zinc-500 font-normal text-[11px]">({currentTenant.slug})</span>
+              {userRole === 'platform_admin' && (
+                <span className="text-zinc-500 font-normal text-[11px]">({currentTenant.slug})</span>
+              )}
               <span className="material-symbols-outlined text-[14px] text-zinc-500 ml-0.5">unfold_more</span>
             </button>
 
@@ -1402,7 +1445,9 @@ export default function LakehouseStudio() {
                               />
                               <div className="flex flex-col truncate">
                                 <span className="text-zinc-200 text-xs truncate font-sans">{t.name}</span>
-                                <span className="text-[10px] text-zinc-500 truncate">{t.slug}</span>
+                                {userRole === 'platform_admin' && (
+                                  <span className="text-[10px] text-zinc-500 truncate">{t.slug}</span>
+                                )}
                               </div>
                             </div>
                             {isSelected && (
@@ -1428,6 +1473,26 @@ export default function LakehouseStudio() {
                     <span className="material-symbols-outlined text-[14px] text-indigo-400">add_circle</span>
                     <span>Create new workspace...</span>
                   </button>
+                </div>
+
+                {/* Role Switcher for verification / testing */}
+                <div className="border-t border-zinc-800/80 pt-1.5 px-2 pb-1 flex items-center justify-between text-[10px] text-zinc-500 font-sans">
+                  <span>Role:</span>
+                  <div className="flex items-center gap-1">
+                    {(['tenant_admin', 'tenant_user', 'platform_admin'] as const).map((r) => (
+                      <button
+                        key={r}
+                        type="button"
+                        onClick={() => setUserRole(r)}
+                        className={`px-1.5 py-0.5 rounded transition-colors ${
+                          userRole === r ? 'bg-zinc-800 text-zinc-200 font-semibold' : 'text-zinc-500 hover:text-zinc-300'
+                        }`}
+                        title={`Switch role to ${r}`}
+                      >
+                        {r === 'platform_admin' ? 'Admin' : r === 'tenant_admin' ? 'Tenant Admin' : 'User'}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}
@@ -1467,80 +1532,67 @@ export default function LakehouseStudio() {
       <div className="flex-1 flex overflow-hidden">
         {/* PRIMARY SIDEBAR (Linear style) */}
         <aside className="w-52 border-r border-app-border bg-app-bg flex flex-col justify-between shrink-0 py-3 select-none">
-          <div className="flex flex-col gap-5 px-3">
-            {/* Section: Workspace */}
-            <div className="flex flex-col gap-0.5">
-              <div className="px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-zinc-400">
-                Workspace
-              </div>
+          <div className="flex flex-col gap-1 px-3">
+            {/* Flat navigation list: Ingestion, SQL Studio, Views */}
 
-              {/* Ingestion Link */}
-              <button
-                onClick={() => setActiveScreen('ingestion')}
-                className={`flex items-center justify-between px-2 py-1.5 rounded transition-colors text-left w-full ${
-                  activeScreen === 'ingestion'
-                    ? 'bg-zinc-900 text-zinc-100 font-medium'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className={`material-symbols-outlined text-[17px] ${activeScreen === 'ingestion' ? 'text-zinc-300' : 'text-zinc-400'}`}>
-                    layers
-                  </span>
-                  <span>Ingestion</span>
-                </div>
-                <span className="text-[11px] font-mono px-1.5 py-0.2 rounded bg-zinc-800/80 text-zinc-400 border border-zinc-700/50">
-                  {datasets.length}
+            {/* Ingestion Link */}
+            <button
+              onClick={() => setActiveScreen('ingestion')}
+              className={`flex items-center justify-between px-2 py-1.5 rounded transition-colors text-left w-full ${
+                activeScreen === 'ingestion'
+                  ? 'bg-zinc-900 text-zinc-100 font-medium'
+                  : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <span className={`material-symbols-outlined text-[17px] ${activeScreen === 'ingestion' ? 'text-zinc-300' : 'text-zinc-400'}`}>
+                  layers
                 </span>
-              </button>
-
-              {/* SQL Studio Link */}
-              <button
-                onClick={() => setActiveScreen('sql')}
-                className={`flex items-center justify-between px-2 py-1.5 rounded transition-colors text-left w-full ${
-                  activeScreen === 'sql'
-                    ? 'bg-zinc-900 text-zinc-100 font-medium'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className={`material-symbols-outlined text-[17px] ${activeScreen === 'sql' ? 'text-zinc-300' : 'text-zinc-400'}`}>
-                    terminal
-                  </span>
-                  <span>SQL Studio</span>
-                </div>
-              </button>
-            </div>
-
-            {/* Section: Storage & Lake */}
-            <div className="flex flex-col gap-0.5">
-              <div className="px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-zinc-400">
-                Storage &amp; Lake
+                <span>Ingestion</span>
               </div>
-              <button
-                onClick={() => setActiveScreen('catalogs')}
-                className={`flex items-center gap-2 px-2 py-1.5 rounded text-left transition-colors w-full ${
-                  activeScreen === 'catalogs'
-                    ? 'bg-zinc-900 text-zinc-100 font-medium'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
-                }`}
-              >
-                <span className="material-symbols-outlined text-[17px] text-zinc-400">folder_data</span>
-                <span>Catalogs</span>
-              </button>
+              <span className="text-[11px] font-mono px-1.5 py-0.2 rounded bg-zinc-800/80 text-zinc-400 border border-zinc-700/50">
+                {datasets.length}
+              </span>
+            </button>
 
-              <button
-                onClick={() => setActiveScreen('views')}
-                className={`flex items-center gap-2 px-2 py-1.5 rounded text-left transition-colors w-full ${
-                  activeScreen === 'views'
-                    ? 'bg-zinc-900 text-zinc-100 font-medium'
-                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
-                }`}
-              >
-                <span className="material-symbols-outlined text-[17px] text-zinc-400">table_chart</span>
-                <span>Iceberg &amp; Views</span>
-              </button>
-            </div>
+            {/* SQL Studio Link */}
+            <button
+              onClick={() => setActiveScreen('sql')}
+              className={`flex items-center justify-between px-2 py-1.5 rounded transition-colors text-left w-full ${
+                activeScreen === 'sql'
+                  ? 'bg-zinc-900 text-zinc-100 font-medium'
+                  : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <span className={`material-symbols-outlined text-[17px] ${activeScreen === 'sql' ? 'text-zinc-300' : 'text-zinc-400'}`}>
+                  terminal
+                </span>
+                <span>SQL Studio</span>
+              </div>
+            </button>
+
+            {/* Views Link */}
+            <button
+              onClick={() => setActiveScreen('views')}
+              className={`flex items-center justify-between px-2 py-1.5 rounded transition-colors text-left w-full ${
+                activeScreen === 'views'
+                  ? 'bg-zinc-900 text-zinc-100 font-medium'
+                  : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <span className={`material-symbols-outlined text-[17px] ${activeScreen === 'views' ? 'text-zinc-300' : 'text-zinc-400'}`}>
+                  table_chart
+                </span>
+                <span>Views</span>
+              </div>
+              {goldObjects.length > 0 && (
+                <span className="text-[11px] font-mono px-1.5 py-0.2 rounded bg-zinc-800/80 text-zinc-400 border border-zinc-700/50">
+                  {goldObjects.length}
+                </span>
+              )}
+            </button>
           </div>
 
           {/* Bottom Minimal Workspace Status */}
@@ -1617,33 +1669,34 @@ export default function LakehouseStudio() {
                           return (
                             <div key={tbl.full_name} className="flex flex-col">
                               <div
-                                onClick={() =>
-                                  setExpandedTables((prev) => ({
-                                    ...prev,
-                                    [tbl.full_name]: !prev[tbl.full_name],
-                                  }))
-                                }
+                                onClick={() => {
+                                  updateCurrentQuery(`SELECT * FROM ${tbl.full_name} LIMIT 100;`)
+                                }}
                                 className="flex items-center justify-between px-2 py-1 rounded hover:bg-zinc-900/60 cursor-pointer text-zinc-200 font-medium group"
+                                title={`Click to insert query for ${tbl.name}`}
                               >
                                 <div className="flex items-center gap-1.5 truncate">
-                                  <span className="material-symbols-outlined text-[14px] text-zinc-400 group-hover:text-zinc-200">
-                                    {isExpanded ? 'expand_more' : 'chevron_right'}
-                                  </span>
-                                  <span className="truncate font-mono text-[12px]">{tbl.name}</span>
-                                </div>
-                                <div className="flex items-center gap-1">
-                                  <span className="text-[9px] font-mono px-1 rounded bg-zinc-800 text-zinc-400">TABLE</span>
-                                  <span
+                                  <button
+                                    type="button"
                                     onClick={(e) => {
                                       e.stopPropagation()
-                                      handleQuickQueryTable(tbl.full_name)
+                                      setExpandedTables((prev) => ({
+                                        ...prev,
+                                        [tbl.full_name]: !prev[tbl.full_name],
+                                      }))
                                     }}
-                                    title="Query Table"
-                                    className="text-zinc-500 hover:text-zinc-200 font-mono text-[11px] shrink-0 px-1 py-0.5 rounded hover:bg-zinc-800"
+                                    className="p-0.5 -ml-1 text-zinc-400 hover:text-zinc-200 rounded transition-colors"
+                                    title={isExpanded ? 'Collapse columns' : 'Expand columns'}
                                   >
-                                    query
-                                  </span>
+                                    <span className="material-symbols-outlined text-[14px] block">
+                                      {isExpanded ? 'expand_more' : 'chevron_right'}
+                                    </span>
+                                  </button>
+                                  <span className="truncate font-mono text-[12px]">{tbl.name}</span>
                                 </div>
+                                <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                                  table
+                                </span>
                               </div>
 
                               {/* Column listing when expanded */}
@@ -1709,42 +1762,34 @@ export default function LakehouseStudio() {
                             return (
                               <div key={tbl.full_name} className="flex flex-col">
                                 <div
-                                  onClick={() =>
-                                    setExpandedTables((prev) => ({
-                                      ...prev,
-                                      [tbl.full_name]: !prev[tbl.full_name],
-                                    }))
-                                  }
+                                  onClick={() => {
+                                    updateCurrentQuery(`SELECT * FROM ${tbl.full_name} LIMIT 100;`)
+                                  }}
                                   className="flex items-center justify-between px-2 py-1 rounded hover:bg-zinc-900/60 cursor-pointer text-zinc-200 font-medium group"
+                                  title={`Click to insert query for ${tbl.name}`}
                                 >
                                   <div className="flex items-center gap-1.5 truncate">
-                                    <span className="material-symbols-outlined text-[14px] text-zinc-400 group-hover:text-zinc-200">
-                                      {isExpanded ? 'expand_more' : 'chevron_right'}
-                                    </span>
-                                    <span className="truncate font-mono text-[12px] text-amber-200/90">{tbl.name}</span>
-                                  </div>
-                                  <div className="flex items-center gap-1">
-                                    <span
-                                      className={`text-[9px] font-mono px-1 rounded ${
-                                        isView
-                                          ? 'bg-sky-950/60 text-sky-400 border border-sky-800/40'
-                                          : 'bg-purple-950/60 text-purple-400 border border-purple-800/40'
-                                      }`}
-                                      title={isView ? 'SQL View (zero storage)' : 'Materialized Parquet Table'}
-                                    >
-                                      {isView ? 'VIEW' : 'TABLE'}
-                                    </span>
-                                    <span
+                                    <button
+                                      type="button"
                                       onClick={(e) => {
                                         e.stopPropagation()
-                                        handleQuickQueryTable(tbl.full_name)
+                                        setExpandedTables((prev) => ({
+                                          ...prev,
+                                          [tbl.full_name]: !prev[tbl.full_name],
+                                        }))
                                       }}
-                                      title="Query Object"
-                                      className="text-zinc-500 hover:text-zinc-200 font-mono text-[11px] shrink-0 px-1 py-0.5 rounded hover:bg-zinc-800"
+                                      className="p-0.5 -ml-1 text-zinc-400 hover:text-zinc-200 rounded transition-colors"
+                                      title={isExpanded ? 'Collapse columns' : 'Expand columns'}
                                     >
-                                      query
-                                    </span>
+                                      <span className="material-symbols-outlined text-[14px] block">
+                                        {isExpanded ? 'expand_more' : 'chevron_right'}
+                                      </span>
+                                    </button>
+                                    <span className="truncate font-mono text-[12px] text-amber-200/90">{tbl.name}</span>
                                   </div>
+                                  <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                                    {isView ? 'view' : 'table'}
+                                  </span>
                                 </div>
 
                                 {/* Column listing when expanded */}
@@ -1805,10 +1850,12 @@ export default function LakehouseStudio() {
 
             {/* MAIN WORKSPACE: SQL Editor (top) + Results (bottom) */}
             <main className="flex-1 flex flex-col bg-app-bg min-w-0">
-              {/* EDITOR REGION (Resizable) */}
+              {/* EDITOR REGION (Resizable when query executed, otherwise expands) */}
               <section
-                style={{ height: `${editorHeight}px` }}
-                className="flex flex-col border-b border-app-border bg-app-surface shrink-0"
+                style={hasQueryExecuted ? { height: `${editorHeight}px` } : undefined}
+                className={`flex flex-col border-b border-app-border bg-app-surface ${
+                  hasQueryExecuted ? 'shrink-0' : 'flex-1 min-h-0'
+                }`}
               >
                 {/* Tab Bar & Controls */}
                 <div className="h-10 border-b border-app-border bg-app-bg px-3 flex items-center justify-between select-none">
@@ -2009,21 +2056,23 @@ export default function LakehouseStudio() {
                 </div>
               </section>
 
-              {/* RESIZER HANDLE: VERTICAL (Between SQL Editor and Results) */}
-              <div
-                onMouseDown={handleStartEditorResize}
-                className={`h-2.5 -my-1 z-30 cursor-row-resize select-none transition-colors relative group flex items-center justify-center shrink-0 ${
-                  isDragging === 'editor' ? 'bg-indigo-500/80' : 'bg-transparent hover:bg-indigo-500/60'
-                }`}
-                title="Drag to resize SQL Editor & Results window"
-              >
-                <div className={`w-12 h-1 rounded-full transition-colors ${
-                  isDragging === 'editor' ? 'bg-indigo-200' : 'bg-zinc-700/60 group-hover:bg-indigo-300'
-                }`} />
-              </div>
+              {/* RESIZER HANDLE: VERTICAL (Between SQL Editor and Results, only when query executed) */}
+              {hasQueryExecuted && (
+                <div
+                  onMouseDown={handleStartEditorResize}
+                  className={`h-2.5 -my-1 z-30 cursor-row-resize select-none transition-colors relative group flex items-center justify-center shrink-0 ${
+                    isDragging === 'editor' ? 'bg-indigo-500/80' : 'bg-transparent hover:bg-indigo-500/60'
+                  }`}
+                  title="Drag to resize SQL Editor & Results window"
+                >
+                  <div className={`w-12 h-1 rounded-full transition-colors ${
+                    isDragging === 'editor' ? 'bg-indigo-200' : 'bg-zinc-700/60 group-hover:bg-indigo-300'
+                  }`} />
+                </div>
+              )}
 
               {/* RESULTS REGION */}
-              <section className="flex-1 flex flex-col min-h-0 bg-app-bg">
+              <section className={hasQueryExecuted ? "flex-1 flex flex-col min-h-0 bg-app-bg" : "shrink-0 flex flex-col bg-app-bg border-t border-app-border"}>
                 {/* Results Sub-header */}
                 <div className="h-9 px-4 border-b border-app-border flex items-center justify-between select-none shrink-0 bg-app-bg">
                   <div className="flex items-center gap-3">
@@ -2035,7 +2084,7 @@ export default function LakehouseStudio() {
                     )}
                   </div>
                   <div className="flex items-center gap-2">
-                    {/* Gold Layer Actions */}
+                    {/* Gold Layer Actions (Section 2.5: Save as view is primary filled; Materialize table is plain-text secondary) */}
                     <button
                       onClick={() => {
                         setGoldActionType('view')
@@ -2044,7 +2093,7 @@ export default function LakehouseStudio() {
                         setGoldModalOpen(true)
                       }}
                       disabled={!queryResult || queryResult.rows.length === 0}
-                      className="px-2.5 py-1 rounded bg-sky-950/50 hover:bg-sky-900/60 text-sky-300 border border-sky-800/60 transition-colors text-xs font-mono disabled:opacity-30 flex items-center gap-1.5 shadow-sm"
+                      className="px-2.5 py-1 rounded bg-zinc-100 hover:bg-white text-zinc-950 font-medium font-sans transition-colors text-xs disabled:opacity-30 flex items-center gap-1.5 shadow-sm"
                       title="Save query as live SQL view in {tenant_id}_gold (zero Parquet storage)"
                     >
                       <span className="material-symbols-outlined text-[14px]">visibility</span>
@@ -2059,7 +2108,7 @@ export default function LakehouseStudio() {
                         setGoldModalOpen(true)
                       }}
                       disabled={!queryResult || queryResult.rows.length === 0}
-                      className="px-2 py-1 rounded hover:bg-zinc-900 text-zinc-400 hover:text-zinc-200 border border-transparent hover:border-zinc-800 transition-colors text-xs font-mono disabled:opacity-30 flex items-center gap-1"
+                      className="px-2 py-1 rounded text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60 transition-colors text-xs font-normal font-sans disabled:opacity-30 flex items-center gap-1"
                       title="Materialize query as table with dedicated Parquet storage (opt-in escape hatch)"
                     >
                       <span className="material-symbols-outlined text-[14px]">table_rows</span>
@@ -2099,111 +2148,116 @@ export default function LakehouseStudio() {
                   </div>
                 </div>
 
-                {/* Error Banner if any */}
-                {queryError && (
-                  <div className="p-4 bg-rose-950/20 border-b border-rose-900/50 flex items-start gap-3 text-xs font-mono text-rose-300">
-                    <span className="material-symbols-outlined text-[16px] text-rose-400 shrink-0 mt-0.5">error</span>
-                    <div className="flex-1">
-                      <div className="font-semibold mb-1">Query Execution Error</div>
-                      <div className="text-rose-400/90 whitespace-pre-wrap">{queryError}</div>
-                    </div>
+                {/* Section 2.4: Compact empty Query Results state before query runs */}
+                {!hasQueryExecuted ? (
+                  <div className="py-3 px-4 text-center text-zinc-500 font-mono text-xs">
+                    No query results yet. Click &quot;Run&quot; or press <kbd className="px-1 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">Ctrl+Enter</kbd> to execute.
                   </div>
-                )}
+                ) : (
+                  <>
+                    {/* Error Banner if any */}
+                    {queryError && (
+                      <div className="p-4 bg-rose-950/20 border-b border-rose-900/50 flex items-start gap-3 text-xs font-mono text-rose-300">
+                        <span className="material-symbols-outlined text-[16px] text-rose-400 shrink-0 mt-0.5">error</span>
+                        <div className="flex-1">
+                          <div className="font-semibold mb-1">Query Execution Error</div>
+                          <div className="text-rose-400/90 whitespace-pre-wrap">{queryError}</div>
+                        </div>
+                      </div>
+                    )}
 
-                {/* Clean Tabular Grid */}
-                <div className="flex-1 overflow-auto">
-                  {queryResult && queryResult.columns.length > 0 ? (
-                    <table className="w-full text-left font-mono text-xs border-collapse">
-                      <thead className="bg-app-surface sticky top-0 z-10 border-b border-app-border select-none">
-                        <tr className="text-zinc-400 font-normal">
-                          {queryResult.columns.map((col, idx) => (
-                            <th
-                              key={col}
-                              className={`px-4 py-2 font-medium ${
-                                idx > 0 && typeof queryResult.rows[0]?.[idx] === 'number'
-                                  ? 'text-right'
-                                  : 'text-left'
-                              }`}
-                            >
-                              {col}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-app-border text-zinc-300">
-                        {paginatedRows.length === 0 ? (
-                          <tr>
-                            <td colSpan={queryResult.columns.length} className="px-4 py-6 text-center text-zinc-500">
-                              0 rows returned
-                            </td>
-                          </tr>
-                        ) : (
-                          paginatedRows.map((row, rowIdx) => (
-                            <tr key={rowIdx} className="hover:bg-zinc-900/50 transition-colors">
-                              {row.map((cell, cellIdx) => {
-                                const isNum = typeof cell === 'number'
-                                return (
-                                  <td
-                                    key={cellIdx}
-                                    className={`px-4 py-2 ${
-                                      cellIdx === 0
-                                        ? 'text-zinc-100 font-medium'
-                                        : isNum
-                                        ? 'text-right'
-                                        : 'text-zinc-300'
-                                    }`}
-                                  >
-                                    {cell === null || cell === undefined ? (
-                                      <span className="text-zinc-600 italic">null</span>
-                                    ) : isNum && (String(queryResult.columns[cellIdx]).includes('spend') || String(queryResult.columns[cellIdx]).includes('revenue')) ? (
-                                      `$${Number(cell).toLocaleString(undefined, { minimumFractionDigits: 2 })}`
-                                    ) : (
-                                      String(cell)
-                                    )}
-                                  </td>
-                                )
-                              })}
+                    {/* Clean Tabular Grid */}
+                    <div className="flex-1 overflow-auto">
+                      {queryResult && queryResult.columns.length > 0 ? (
+                        <table className="w-full text-left font-mono text-xs border-collapse">
+                          <thead className="bg-app-surface sticky top-0 z-10 border-b border-app-border select-none">
+                            <tr className="text-zinc-400 font-normal">
+                              {queryResult.columns.map((col, idx) => (
+                                <th
+                                  key={col}
+                                  className={`px-4 py-2 font-medium ${
+                                    idx > 0 && typeof queryResult.rows[0]?.[idx] === 'number'
+                                      ? 'text-right'
+                                      : 'text-left'
+                                  }`}
+                                >
+                                  {col}
+                                </th>
+                              ))}
                             </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
-                  ) : !queryError ? (
-                    <div className="p-8 text-center text-zinc-500 font-mono text-xs">
-                      No query results yet. Click "Run" or press Ctrl+Enter to execute.
+                          </thead>
+                          <tbody className="divide-y divide-app-border text-zinc-300">
+                            {paginatedRows.length === 0 ? (
+                              <tr>
+                                <td colSpan={queryResult.columns.length} className="px-4 py-6 text-center text-zinc-500">
+                                  0 rows returned
+                                </td>
+                              </tr>
+                            ) : (
+                              paginatedRows.map((row, rowIdx) => (
+                                <tr key={rowIdx} className="hover:bg-zinc-900/50 transition-colors">
+                                  {row.map((cell, cellIdx) => {
+                                    const isNum = typeof cell === 'number'
+                                    return (
+                                      <td
+                                        key={cellIdx}
+                                        className={`px-4 py-2 ${
+                                          cellIdx === 0
+                                            ? 'text-zinc-100 font-medium'
+                                            : isNum
+                                            ? 'text-right'
+                                            : 'text-zinc-300'
+                                        }`}
+                                      >
+                                        {cell === null || cell === undefined ? (
+                                          <span className="text-zinc-600 italic">null</span>
+                                        ) : isNum && (String(queryResult.columns[cellIdx]).includes('spend') || String(queryResult.columns[cellIdx]).includes('revenue')) ? (
+                                          `$${Number(cell).toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+                                        ) : (
+                                          String(cell)
+                                        )}
+                                      </td>
+                                    )
+                                  })}
+                                </tr>
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      ) : null}
                     </div>
-                  ) : null}
-                </div>
 
-                {/* Clean Linear-style Pagination Bar */}
-                <div className="h-9 px-4 border-t border-app-border flex items-center justify-between select-none shrink-0 bg-app-bg text-xs font-mono text-zinc-400">
-                  <div>
-                    <span>
-                      {totalRows === 0 ? '0 of 0' : `${startRowIndex}–${endRowIndex} of ${totalRows}`}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                      disabled={currentPage <= 1}
-                      className="px-2 py-1 rounded hover:bg-zinc-900 hover:text-zinc-200 text-zinc-400 transition-colors flex items-center gap-0.5 disabled:opacity-30"
-                    >
-                      <span className="material-symbols-outlined text-[13px]">chevron_left</span>
-                      <span>Prev</span>
-                    </button>
-                    <span className="px-2 text-zinc-400">
-                      {currentPage} / {totalPages}
-                    </span>
-                    <button
-                      onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-                      disabled={currentPage >= totalPages}
-                      className="px-2 py-1 rounded hover:bg-zinc-900 hover:text-zinc-200 text-zinc-400 transition-colors flex items-center gap-0.5 disabled:opacity-30"
-                    >
-                      <span>Next</span>
-                      <span className="material-symbols-outlined text-[13px]">chevron_right</span>
-                    </button>
-                  </div>
-                </div>
+                    {/* Clean Linear-style Pagination Bar */}
+                    <div className="h-9 px-4 border-t border-app-border flex items-center justify-between select-none shrink-0 bg-app-bg text-xs font-mono text-zinc-400">
+                      <div>
+                        <span>
+                          {totalRows === 0 ? '0 of 0' : `${startRowIndex}–${endRowIndex} of ${totalRows}`}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                          disabled={currentPage <= 1}
+                          className="px-2 py-1 rounded hover:bg-zinc-900 hover:text-zinc-200 text-zinc-400 transition-colors flex items-center gap-0.5 disabled:opacity-30"
+                        >
+                          <span className="material-symbols-outlined text-[13px]">chevron_left</span>
+                          <span>Prev</span>
+                        </button>
+                        <span className="px-2 text-zinc-400">
+                          {currentPage} / {totalPages}
+                        </span>
+                        <button
+                          onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                          disabled={currentPage >= totalPages}
+                          className="px-2 py-1 rounded hover:bg-zinc-900 hover:text-zinc-200 text-zinc-400 transition-colors flex items-center gap-0.5 disabled:opacity-30"
+                        >
+                          <span>Next</span>
+                          <span className="material-symbols-outlined text-[13px]">chevron_right</span>
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
               </section>
             </main>
           </>
@@ -2222,7 +2276,10 @@ export default function LakehouseStudio() {
 
               <div className="flex items-center gap-2 text-xs text-text-secondary">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                <span className="font-mono text-zinc-300">{currentTenant.name} ({currentTenant.slug})</span>
+                <span className="font-mono text-zinc-300">
+                  {currentTenant.name}
+                  {userRole === 'platform_admin' && ` (${currentTenant.slug})`}
+                </span>
               </div>
             </header>
 
@@ -2249,7 +2306,10 @@ export default function LakehouseStudio() {
                   <div className="flex flex-col gap-1.5">
                     <label className="font-mono text-[11px] uppercase tracking-wider text-text-muted">Tenant</label>
                     <div className="h-9 px-3 rounded border border-border-subtle bg-zinc-900/40 flex items-center justify-between text-xs text-text-secondary font-mono">
-                      <span className="truncate">{currentTenant.name} ({currentTenant.slug})</span>
+                      <span className="truncate">
+                        {currentTenant.name}
+                        {userRole === 'platform_admin' && ` (${currentTenant.slug})`}
+                      </span>
                       <span className="material-symbols-outlined text-[14px] text-text-muted shrink-0 ml-1">lock</span>
                     </div>
                   </div>
@@ -2662,57 +2722,208 @@ export default function LakehouseStudio() {
           </main>
         )}
 
-        {/* SCREEN 3: STORAGE & LAKE (Catalogs / Views) */}
-        {(activeScreen === 'catalogs' || activeScreen === 'views') && (
-          <main className="flex-1 flex flex-col bg-app-bg min-w-0 p-8 overflow-y-auto font-mono text-xs">
-            <div className="max-w-4xl mx-auto flex flex-col gap-6 w-full">
-              <div className="pb-4 border-b border-app-border">
-                <h1 className="text-base font-semibold text-zinc-100 font-sans">
-                  {activeScreen === 'catalogs' ? 'Local Lakehouse Catalogs' : 'Iceberg & Parquet Views'}
-                </h1>
-                <p className="text-zinc-500 font-sans text-xs mt-1">
-                  PostgreSQL embedded catalog (`ducklake_catalog`) &amp; RustFS S3 object storage layout.
-                </p>
+        {/* SCREEN 3: VIEWS (Section 4) */}
+        {activeScreen === 'views' && (
+          <main className="flex-1 flex flex-col bg-surface min-w-0 overflow-y-auto">
+            {/* VIEWS SUB-HEADER BREADCRUMB */}
+            <header className="h-12 border-b border-border-subtle bg-surface/95 backdrop-blur z-20 flex items-center justify-between px-8 shrink-0">
+              <div className="flex items-center gap-2 text-xs text-text-secondary">
+                <span className="text-text-muted">Workspace</span>
+                <span className="text-zinc-600">/</span>
+                <span className="text-text-primary font-medium">Views</span>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="p-4 rounded-md border border-app-border bg-app-surface flex flex-col gap-2">
-                  <div className="text-zinc-300 font-semibold font-sans">Embedded Catalog Layer</div>
-                  <div className="text-zinc-500 text-[11px]">Database: PostgreSQL 16 (Port 5432)</div>
-                  <div className="text-zinc-500 text-[11px]">Catalog Schema: `ducklake_catalog`</div>
-                  <div className="text-zinc-500 text-[11px]">Core State: `payload_core`</div>
-                  <div className="text-emerald-400 text-[11px] flex items-center gap-1 mt-2">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                    Operational &amp; Synchronized
-                  </div>
-                </div>
-
-                <div className="p-4 rounded-md border border-app-border bg-app-surface flex flex-col gap-2">
-                  <div className="text-zinc-300 font-semibold font-sans">Object Storage (RustFS S3)</div>
-                  <div className="text-zinc-500 text-[11px]">Endpoint: http://storage:9000</div>
-                  <div className="text-zinc-500 text-[11px]">Bucket: lakehouse-bucket</div>
-                  <div className="text-zinc-500 text-[11px]">Tenant Prefix: tenants/{tenantId}/*</div>
-                  <div className="text-emerald-400 text-[11px] flex items-center gap-1 mt-2">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                    STS Scoped Enforced
-                  </div>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3 pt-4">
+              <div className="flex items-center gap-3">
+                <span className="text-text-muted font-mono text-[11px]">
+                  {goldObjects.length} {goldObjects.length === 1 ? 'object' : 'objects'}
+                </span>
                 <button
-                  onClick={() => setActiveScreen('sql')}
-                  className="px-3 py-1.5 rounded bg-zinc-100 text-zinc-950 font-sans font-medium text-xs hover:bg-white transition-colors"
+                  type="button"
+                  onClick={() => fetchGoldObjects(tenantId)}
+                  disabled={isGoldLoading}
+                  className="p-1 rounded hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors"
+                  title="Refresh Gold views and tables"
                 >
-                  Return to SQL Studio
-                </button>
-                <button
-                  onClick={() => setActiveScreen('ingestion')}
-                  className="px-3 py-1.5 rounded bg-zinc-800 text-zinc-300 font-sans font-medium text-xs hover:bg-zinc-700 transition-colors"
-                >
-                  Go to Data Ingestion
+                  <span className={`material-symbols-outlined text-[15px] block ${isGoldLoading ? 'animate-spin' : ''}`}>
+                    refresh
+                  </span>
                 </button>
               </div>
+            </header>
+
+            {/* CONTENT CONTAINER */}
+            <div className="max-w-6xl mx-auto px-8 py-8 flex flex-col gap-6 w-full">
+              {/* PAGE HEADING */}
+              <div className="flex flex-col sm:flex-row sm:items-baseline justify-between pb-6 border-b border-border-subtle gap-2">
+                <div>
+                  <h1 className="text-lg font-semibold tracking-tight text-text-primary">Views</h1>
+                  <p className="text-xs text-text-secondary mt-0.5">
+                    Gold-layer virtual views and materialized tables with dependency mapping.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 text-xs font-mono text-text-muted">
+                  <span>Schema:</span>
+                  <span className="text-zinc-300 font-semibold">{tenantId}_gold</span>
+                </div>
+              </div>
+
+              {/* VIEWS LIST OR QUIET EMPTY STATE */}
+              {goldObjects.length === 0 ? (
+                <div className="py-16 text-center text-zinc-500 font-sans text-xs">
+                  No views yet —{' '}
+                  <button
+                    onClick={() => setActiveScreen('sql')}
+                    className="text-zinc-400 hover:text-zinc-200 underline underline-offset-2 transition-colors font-sans"
+                  >
+                    save a query from SQL Studio
+                  </button>{' '}
+                  to create one
+                </div>
+              ) : (
+                <div className="border border-border-subtle rounded-md overflow-hidden bg-surface-subtle">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-border-subtle font-mono text-[11px] uppercase tracking-wider text-text-muted bg-zinc-900/50">
+                        <th className="py-2.5 px-4 font-normal">Object Name</th>
+                        <th className="py-2.5 px-4 font-normal">Type</th>
+                        <th className="py-2.5 px-4 font-normal">Source Tables</th>
+                        <th className="py-2.5 px-4 font-normal text-right">Details</th>
+                        <th className="py-2.5 px-4 font-normal text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border-subtle font-mono">
+                      {goldObjects.map((obj) => {
+                        const isExpanded = !!expandedGoldObjects[obj.name]
+                        const isView = obj.objectType === 'view'
+
+                        // Proactive dependency check:
+                        // Verify all source tables exist in active tenant tables (Silver or Gold)
+                        const activeTableNames = new Set(
+                          tables.map((t) => t.name.toLowerCase())
+                        )
+                        const activeFullNames = new Set(
+                          tables.map((t) => t.full_name.toLowerCase())
+                        )
+
+                        const hasMissingSource =
+                          obj.dependencies.length > 0 &&
+                          obj.dependencies.some((dep) => {
+                            const cleanDep = dep
+                              .toLowerCase()
+                              .replace(`${tenantId.toLowerCase()}_silver.`, '')
+                              .replace(`${tenantId.toLowerCase()}_gold.`, '')
+                              .replace(`${tenantId.toLowerCase()}_`, '')
+                            return !activeTableNames.has(cleanDep) && !activeFullNames.has(dep.toLowerCase())
+                          })
+
+                        return (
+                          <React.Fragment key={obj.id || obj.name}>
+                            <tr
+                              onClick={() =>
+                                setExpandedGoldObjects((prev) => ({
+                                  ...prev,
+                                  [obj.name]: !prev[obj.name],
+                                }))
+                              }
+                              className="hover:bg-zinc-900/40 transition-colors cursor-pointer group"
+                            >
+                              {/* Object name (white, monospace) */}
+                              <td className="py-2.5 px-4 text-zinc-100 font-medium">
+                                <div className="flex items-center gap-2">
+                                  <span className="material-symbols-outlined text-[14px] text-zinc-500 group-hover:text-zinc-300 transition-colors">
+                                    {isExpanded ? 'expand_more' : 'chevron_right'}
+                                  </span>
+                                  <span className="font-mono text-xs">{obj.name}</span>
+                                </div>
+                              </td>
+
+                              {/* Type: plain gray text, "view" or "table" (no badges) */}
+                              <td className="py-2.5 px-4 text-zinc-500 lowercase text-[10px] font-mono">
+                                {isView ? 'view' : 'table'}
+                              </td>
+
+                              {/* Source tables (or muted-red "Source table missing" indicator) */}
+                              <td className="py-2.5 px-4 font-mono text-xs">
+                                {hasMissingSource ? (
+                                  <span className="text-rose-400 font-mono text-xs">Source table missing</span>
+                                ) : obj.dependencies.length > 0 ? (
+                                  <span className="text-zinc-500">{obj.dependencies.join(', ')}</span>
+                                ) : (
+                                  <span className="text-zinc-600">—</span>
+                                )}
+                              </td>
+
+                              {/* Materialized tables only: row count and last-materialized timestamp right-aligned in muted gray */}
+                              <td className="py-2.5 px-4 text-right text-zinc-500 font-mono text-xs">
+                                {!isView ? (
+                                  <span>
+                                    {obj.rowCount != null ? `${Number(obj.rowCount).toLocaleString()} rows` : ''}
+                                    {obj.rowCount != null && obj.updatedAt ? ' · ' : ''}
+                                    {obj.updatedAt
+                                      ? new Date(obj.updatedAt).toLocaleDateString([], {
+                                          month: 'short',
+                                          day: 'numeric',
+                                          hour: '2-digit',
+                                          minute: '2-digit',
+                                        })
+                                      : ''}
+                                  </span>
+                                ) : null}
+                              </td>
+
+                              {/* Action: Delete triggering dataset deletion flow with dependency check */}
+                              <td className="py-2.5 px-4 text-right">
+                                <div
+                                  className="flex items-center justify-end"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setDeletingItem({
+                                        name: obj.name,
+                                        layer: 'gold',
+                                        objectType: obj.objectType,
+                                      })
+                                      setDeleteWarning(null)
+                                      setDeleteModalOpen(true)
+                                    }}
+                                    className="p-1 rounded text-zinc-500 hover:text-rose-400 hover:bg-zinc-800 transition-colors"
+                                    title={`Delete Gold ${obj.objectType} '${obj.name}'`}
+                                  >
+                                    <span className="material-symbols-outlined text-[15px] block">delete</span>
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+
+                            {/* Expandable SQL definition in monospace read-only format */}
+                            {isExpanded && (
+                              <tr>
+                                <td colSpan={5} className="bg-zinc-950/70 p-4 border-b border-border-subtle">
+                                  <div className="flex flex-col gap-2">
+                                    <div className="flex items-center justify-between text-[11px] font-mono text-zinc-500">
+                                      <span>
+                                        Definition ({isView ? `CREATE VIEW ${tenantId}_gold.${obj.name}` : `CREATE TABLE ${tenantId}_gold.${obj.name}`}):
+                                      </span>
+                                      <span className="text-zinc-600 text-[10px]">
+                                        Read-only · Re-run in SQL Studio to update
+                                      </span>
+                                    </div>
+                                    <pre className="p-3 rounded bg-zinc-950 border border-zinc-800/80 text-zinc-300 font-mono text-xs overflow-x-auto select-text whitespace-pre leading-relaxed">
+                                      {obj.sqlQuery || `SELECT * FROM ${tenantId}_silver.${obj.name};`}
+                                    </pre>
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </main>
         )}
