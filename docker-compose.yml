@@ -96,7 +96,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1024M
+          memory: 2048M
     environment:
       DATABASE_URI: postgres://${POSTGRES_USER:-lakehouse_admin}:${POSTGRES_PASSWORD:-lakehouse_secret_change_me}@postgres:5432/${POSTGRES_DB:-lakehouse}
       PAYLOAD_SECRET: ${PAYLOAD_SECRET:-dev_secret_key_1234567890}

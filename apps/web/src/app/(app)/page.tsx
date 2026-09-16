@@ -1593,6 +1593,23 @@ export default function LakehouseStudio() {
                 </span>
               )}
             </button>
+
+            {/* Payload Admin Link */}
+            <a
+              href="/admin"
+              className="flex items-center justify-between px-2 py-1.5 rounded transition-colors text-left w-full text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60"
+              title="Open Payload CMS Admin Panel"
+            >
+              <div className="flex items-center gap-2">
+                <span className="material-symbols-outlined text-[17px] text-zinc-400">
+                  admin_panel_settings
+                </span>
+                <span>Payload Admin</span>
+              </div>
+              <span className="material-symbols-outlined text-[13px] text-zinc-500">
+                open_in_new
+              </span>
+            </a>
           </div>
 
           {/* Bottom Minimal Workspace Status */}
