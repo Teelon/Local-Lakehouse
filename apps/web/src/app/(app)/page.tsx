@@ -15,6 +15,7 @@ const SqlEditor = dynamic(() => import('./components/SqlEditor'), {
 })
 
 import TableSuggestionModal from './components/TableSuggestionModal'
+import DocumentationView from './components/DocumentationView'
 import {
   findSchemaMatches,
   generateTableNameSuggestions,
@@ -339,8 +340,8 @@ function lintSQL(sql: string, tenantId: string): LintIssue[] {
 }
 
 export default function LakehouseStudio() {
-  // Navigation: 'sql' | 'ingestion' | 'views'
-  const [activeScreen, setActiveScreen] = useState<'sql' | 'ingestion' | 'views'>('sql')
+  // Navigation: 'sql' | 'ingestion' | 'views' | 'docs'
+  const [activeScreen, setActiveScreen] = useState<'sql' | 'ingestion' | 'views' | 'docs'>('sql')
 
   // User Role (Section 2.3: Hide slug for tenant_user and tenant_admin, show for platform_admin)
   const [userRole, setUserRole] = useState<'platform_admin' | 'tenant_admin' | 'tenant_user'>('tenant_admin')
@@ -1610,6 +1611,28 @@ export default function LakehouseStudio() {
                 open_in_new
               </span>
             </a>
+
+            {/* Documentation Link (Placed at the bottom of the menu area) */}
+            <div className="pt-2 mt-2 border-t border-app-border/50">
+              <button
+                onClick={() => setActiveScreen('docs')}
+                className={`flex items-center justify-between px-2 py-1.5 rounded transition-colors text-left w-full ${
+                  activeScreen === 'docs'
+                    ? 'bg-zinc-900 text-zinc-100 font-medium'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/60'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className={`material-symbols-outlined text-[17px] ${activeScreen === 'docs' ? 'text-indigo-400' : 'text-zinc-400'}`}>
+                    menu_book
+                  </span>
+                  <span>Documentation</span>
+                </div>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+                  Docs
+                </span>
+              </button>
+            </div>
           </div>
 
           {/* Bottom Minimal Workspace Status */}
@@ -2943,6 +2966,22 @@ export default function LakehouseStudio() {
               )}
             </div>
           </main>
+        )}
+
+        {/* SCREEN 4: DOCUMENTATION */}
+        {activeScreen === 'docs' && (
+          <DocumentationView
+            tenantId={tenantId}
+            onNavigateToUpload={() => setActiveScreen('ingestion')}
+            onNavigateToSql={(query) => {
+              if (query) {
+                setQueryTabs((prev) =>
+                  prev.map((t) => (t.id === activeTabId ? { ...t, query } : t))
+                )
+              }
+              setActiveScreen('sql')
+            }}
+          />
         )}
         {/* MODAL 1: SAVE AS GOLD VIEW / MATERIALIZE AS TABLE */}
         {goldModalOpen && (
