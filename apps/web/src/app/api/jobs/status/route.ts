@@ -5,36 +5,59 @@ import configPromise from '../../../../payload.config'
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url)
+    // NOTE: tenant_id is caller-supplied and not cryptographically verified (MVP 1 — no auth).
+    // Tenant boundaries ARE enforced via the query filter below.
     const tenantId = searchParams.get('tenant_id') || 'tenant_acme'
 
     const payload = await getPayload({ config: configPromise })
 
-    // Find datasets for tenant
-    const datasets = await payload.find({
+    // Resolve tenant document — needed to filter datasets by tenant ID (not slug),
+    // which is the correct foreign-key field in the datasets collection.
+    const tenantLookup = await payload.find({
+      collection: 'tenants',
+      where: { slug: { equals: tenantId } },
+      limit: 1,
+    })
+
+    const tenantDoc = tenantLookup.docs[0] ?? null
+
+    // Fail-closed guard: if tenant does not resolve (invalid ID, typo, probe),
+    // immediately return empty results rather than falling through to an unfiltered query.
+    if (!tenantDoc) {
+      return NextResponse.json({
+        success: true,
+        tenant_id: tenantId,
+        datasets: [],
+        jobs: [],
+      })
+    }
+
+    // Tenant filter is strictly applied in the Payload query before limit applies.
+    const datasetsResult = await payload.find({
       collection: 'datasets',
       depth: 1,
       sort: '-createdAt',
       limit: 20,
+      where: { tenant: { equals: tenantDoc.id } },
     })
 
-    // Filter by tenant if needed
-    const filtered = datasets.docs.filter((d: any) => {
-      if (!tenantId) return true
-      if (typeof d.tenant === 'object' && d.tenant !== null) {
-        return d.tenant.slug === tenantId || d.tenant.id === tenantId
-      }
-      return d.tenant === tenantId
-    })
+    const filtered = datasetsResult.docs
+    const datasetIds = new Set(filtered.map((d: any) => String(d.id)))
 
-    // Also fetch payload-jobs if enabled
+    // Also fetch payload-jobs if enabled, strictly scoped to this tenant
     let jobsList: any[] = []
     try {
       const jobs = await (payload as any).find({
         collection: 'payload-jobs',
-        limit: 20,
+        limit: 50,
         sort: '-createdAt',
       })
-      jobsList = jobs.docs || []
+      const allJobs = jobs.docs || []
+      jobsList = allJobs.filter((j: any) => {
+        if (j.input?.tenantId) return j.input.tenantId === tenantId
+        if (j.input?.datasetId && datasetIds.has(String(j.input.datasetId))) return true
+        return false
+      }).slice(0, 20)
     } catch (e) {
       // payload-jobs collection may be internally named or not queried directly
     }

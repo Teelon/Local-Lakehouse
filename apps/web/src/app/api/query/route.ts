@@ -4,6 +4,8 @@ import { LakehouseQueryService } from '@/services/query-service'
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
+    // NOTE: tenant_id is caller-supplied and not cryptographically verified (MVP 1 — no auth).
+    // SQL guardrails in LakehouseQueryService.validateQuery() enforce tenant isolation on queries.
     const { query, tenant_id = 'tenant_acme', max_rows = 1000 } = body
 
     if (!query) {

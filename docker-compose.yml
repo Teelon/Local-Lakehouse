@@ -72,8 +72,9 @@ services:
       S3_ROOT_PASSWORD: ${S3_ROOT_PASSWORD:-storage_secret_change_me}
       S3_BUCKET_NAME: ${S3_BUCKET_NAME:-lakehouse-bucket}
       S3_REGION: ${S3_REGION:-us-east-1}
-    ports:
-      - "${WORKER_PORT:-8000}:8000"
+    # Port intentionally NOT exposed to host — worker is internal-only.
+    # The web container reaches it via the Compose network at http://worker:8000.
+    # Exposing this port would allow direct access to /api/v1/query with no guardrails.
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')\""]
       interval: 10s

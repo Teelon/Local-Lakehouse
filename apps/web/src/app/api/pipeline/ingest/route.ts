@@ -2,10 +2,13 @@ import { NextRequest, NextResponse } from 'next/server'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import { getPayload } from 'payload'
 import configPromise from '../../../../payload.config'
+import { getTenantScopedCredentials } from '@/lib/s3-credentials'
 
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData()
+    // NOTE: tenant_id is caller-supplied and not cryptographically verified (MVP 1 — no auth).
+    // Tenant storage isolation IS enforced via STS-scoped credentials and S3 key prefix namespacing.
     const tenantId = (formData.get('tenant_id') as string)?.trim() || 'tenant_acme'
     const rawTableName = (formData.get('table_name') as string)?.trim() || ''
     const file = formData.get('file') as File
@@ -35,10 +38,13 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
 
-    // 1. Upload raw object directly to RustFS S3 under tenant raw prefix
+    // 1. Obtain tenant-scoped temporary S3 credentials via STS.
+    // Previously this used root credentials (S3_ROOT_USER/S3_ROOT_PASSWORD) directly,
+    // bypassing the tenant-scoped credential system that already existed in /api/auth/sts.
+    // STS scoping ensures uploads can only land under tenants/{tenantId}/* in the bucket.
+    const scopedCreds = await getTenantScopedCredentials(tenantId)
+
     const s3Endpoint = process.env.S3_ENDPOINT || 'http://storage:9000'
-    const accessKeyId = process.env.S3_ROOT_USER || 'lakehouse_storage_admin'
-    const secretAccessKey = process.env.S3_ROOT_PASSWORD || 'storage_secret_change_me'
     const bucket = process.env.S3_BUCKET_NAME || 'lakehouse-bucket'
     const region = process.env.S3_REGION || 'us-east-1'
 
@@ -47,8 +53,9 @@ export async function POST(req: NextRequest) {
       region,
       forcePathStyle: true,
       credentials: {
-        accessKeyId,
-        secretAccessKey,
+        accessKeyId: scopedCreds.accessKeyId,
+        secretAccessKey: scopedCreds.secretAccessKey,
+        ...(scopedCreds.sessionToken ? { sessionToken: scopedCreds.sessionToken } : {}),
       },
     })
 

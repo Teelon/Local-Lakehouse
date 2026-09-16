@@ -38,6 +38,39 @@ Most small teams face a dilemma when scaling analytical workloads:
 
 ---
 
+## ⚠️ Security Model (MVP 1 — No Authentication)
+
+> **This is intentional, not an oversight.** Read before deploying.
+
+Local Lakehouse MVP 1 is designed for **small teams of trusted users** running a self-hosted instance. It has **no session-based, JWT, or OAuth authentication**.
+
+### What this means
+
+- `tenant_id` is a **caller-supplied value** passed in the request body or query string.
+- It is **not cryptographically verified** against any logged-in identity.
+- Nothing in the current code prevents a caller from claiming to be any tenant.
+
+### What IS enforced (without authentication)
+
+| Boundary | Mechanism |
+|----------|-----------|
+| SQL query content | `query-service.ts` `validateQuery()` — keyword blocklist, schema blocklist, cross-tenant prefix checks |
+| S3 storage namespacing | Key prefix `tenants/{tenant_id}/...` on every read/write |
+| STS credential scoping | Upload credentials are restricted to `tenants/{tenant_id}/*` via STS AssumeRole |
+| Catalog schema naming | DuckDB schemas `{tenant_id}_silver` / `{tenant_id}_gold` are separate per tenant |
+| Worker network | The Python worker is **not** exposed to the host network — reachable only by the Next.js container internally |
+
+### What is NOT enforced
+
+- A caller cannot be *prevented* from claiming to be a different tenant — there is no identity verification.
+- If you add a second tenant, a malicious client could access that tenant's data by passing the other tenant's ID.
+
+### Before deploying with untrusted users or publicly
+
+Add authentication (session-based, JWT, or OAuth) that cryptographically ties `tenant_id` to a verified identity before exposing this service on a public network.
+
+---
+
 ## Architecture & Components
 
 ```
