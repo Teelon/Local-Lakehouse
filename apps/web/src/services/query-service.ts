@@ -1,5 +1,3 @@
-import duckdb from 'duckdb'
-
 export interface QueryResult {
   columns: string[]
   rows: any[][]
@@ -8,10 +6,109 @@ export interface QueryResult {
 }
 
 export class LakehouseQueryService {
-  private s3Endpoint: string
+  private workerUrl: string
 
-  constructor(s3Endpoint = 'http://localhost:9000') {
-    this.s3Endpoint = s3Endpoint
+  constructor(workerUrl = process.env.WORKER_URL || 'http://worker:8000') {
+    this.workerUrl = workerUrl
+  }
+
+  /**
+   * Validates and enforces tenant isolation guardrails before sending query to DuckDB.
+   */
+  public validateQuery(tenantId: string, sqlQuery: string): void {
+    const trimmed = sqlQuery.trim()
+    if (!trimmed) {
+      throw new Error('Query cannot be empty.')
+    }
+
+    const lower = trimmed.toLowerCase()
+
+    // 1. Guardrail: Prohibit modifications and administrative commands
+    const forbiddenKeywords = [
+      'drop',
+      'alter',
+      'delete',
+      'insert',
+      'update',
+      'attach',
+      'detach',
+      'copy',
+      'export',
+      'create',
+      'vacuum',
+      'install',
+      'load',
+    ]
+
+    for (const kw of forbiddenKeywords) {
+      const regex = new RegExp(`(^|\\s|;)${kw}(\\s|;|$)`, 'i')
+      if (regex.test(lower)) {
+        throw new Error(`Modification query with '${kw}' is prohibited in Query Studio.`)
+      }
+    }
+
+    // 2. Guardrail: Reject multiple chained SQL statements (SQL injection mitigation)
+    const statements = trimmed
+      .split(';')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (statements.length > 1) {
+      throw new Error('Executing multiple chained SQL statements is prohibited.')
+    }
+
+    // 3. Guardrail: Tenant Isolation & Foreign Schema Protection (Phase 5.2)
+    // Extract tables referenced in FROM or JOIN clauses
+    const tableRefRegex = /(?:from|join)\s+([a-zA-Z0-9_."]+)/gi
+    let match: RegExpExecArray | null
+    const matchedTables: string[] = []
+
+    while ((match = tableRefRegex.exec(trimmed)) !== null) {
+      const rawName = match[1].replace(/["`]/g, '').trim()
+      matchedTables.push(rawName)
+    }
+
+    // Prohibit cross-schema traversal (e.g. tenant_b.table, ducklake_catalog.table, payload_core.table)
+    const forbiddenSchemas = ['ducklake_catalog', 'payload_core', 'information_schema', 'pg_catalog']
+    for (const schema of forbiddenSchemas) {
+      if (lower.includes(`${schema}.`) || lower.includes(`"${schema}"`)) {
+        throw new Error(
+          `Access Denied: Cross-schema query to '${schema}' is prohibited. Queries must stay within tenant workspace.`
+        )
+      }
+    }
+
+    // Direct file readers bypassing catalog
+    if (lower.includes('read_parquet(') || lower.includes('read_csv(') || lower.includes('read_json(')) {
+      if (lower.includes('tenants/') && !lower.includes(`tenants/${tenantId.toLowerCase()}/`)) {
+        throw new Error(
+          `Access Denied: Query attempts to read object storage outside tenant '${tenantId}' scope.`
+        )
+      }
+    }
+
+    // Check each referenced table
+    for (const table of matchedTables) {
+      const tableLower = table.toLowerCase()
+      const tId = tenantId.toLowerCase()
+      const allowedSchemas = [tId, `${tId}_silver`, `${tId}_gold`]
+
+      // If query references a table with a dot e.g. schema.table
+      if (tableLower.includes('.')) {
+        const [schemaPart] = tableLower.split('.')
+        if (!allowedSchemas.includes(schemaPart)) {
+          throw new Error(
+            `Access Denied: Cross-tenant schema access prohibited. Foreign schema '${schemaPart}' is not allowed for tenant '${tenantId}'.`
+          )
+        }
+      } else {
+        // Flat table name e.g. tenant_b_customers or other_tenant_...
+        if (tableLower.startsWith('tenant_') && !tableLower.startsWith(`${tId}_`)) {
+          throw new Error(
+            `Access Denied: Cross-tenant table access prohibited for tenant '${tenantId}'. Table '${table}' does not belong to your tenant workspace.`
+          )
+        }
+      }
+    }
   }
 
   /**
@@ -22,44 +119,36 @@ export class LakehouseQueryService {
     sqlQuery: string,
     maxRows = 1000
   ): Promise<QueryResult> {
-    const lower = sqlQuery.trim().toLowerCase()
-    const forbiddenKeywords = ['drop', 'alter', 'delete', 'insert', 'update', 'attach', 'detach', 'copy', 'export']
+    // Run security and isolation guardrails
+    this.validateQuery(tenantId, sqlQuery)
 
-    for (const kw of forbiddenKeywords) {
-      if (lower.startsWith(kw) || lower.includes(` ${kw} `)) {
-        throw new Error(`Modification query with '${kw}' is prohibited in Query Studio.`)
-      }
+    // Execute query via worker analytics engine
+    const res = await fetch(`${this.workerUrl}/api/v1/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: sqlQuery,
+        tenant_id: tenantId,
+      }),
+    })
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({ detail: 'Query execution failed' }))
+      throw new Error(errData.detail || errData.error || 'Query execution failed')
     }
 
-    return new Promise((resolve, reject) => {
-      const db = new duckdb.Database(':memory:')
-      const con = db.connect()
+    const data = await res.json()
+    const columns: string[] = data.columns || []
+    const rawRows: any[][] = data.rows || []
+    const rowCount = rawRows.length
+    const truncated = rowCount > maxRows
+    const slicedRows = truncated ? rawRows.slice(0, maxRows) : rawRows
 
-      con.all(sqlQuery, (err, rows) => {
-        if (err) {
-          return reject(err)
-        }
-
-        if (!rows || rows.length === 0) {
-          return resolve({
-            columns: [],
-            rows: [],
-            rowCount: 0,
-            truncated: false,
-          })
-        }
-
-        const columns = Object.keys(rows[0])
-        const truncated = rows.length > maxRows
-        const slicedRows = rows.slice(0, maxRows).map((row) => columns.map((col) => row[col]))
-
-        resolve({
-          columns,
-          rows: slicedRows,
-          rowCount: slicedRows.length,
-          truncated,
-        })
-      })
-    })
+    return {
+      columns,
+      rows: slicedRows,
+      rowCount: slicedRows.length,
+      truncated,
+    }
   }
 }

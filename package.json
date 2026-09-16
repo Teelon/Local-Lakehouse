@@ -1,6 +1,6 @@
 {
   "name": "local-lakehouse-monorepo",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha",
   "private": true,
   "scripts": {
     "dev": "npm --prefix apps/web run dev",

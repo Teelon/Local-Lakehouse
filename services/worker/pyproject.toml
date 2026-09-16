@@ -1,7 +1,7 @@
 [project]
 name = "lakehouse-worker"
 version = "0.1.0"
-description = "Asynchronous Data Ingestion and DuckLake Processing Worker"
+description = "Asynchronous Data Ingestion and Local Lakehouse Processing Worker"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,8 @@ dependencies = [
     "httpx>=0.27.0",
     "psycopg2-binary>=2.9.9",
     "python-multipart>=0.0.9",
-    "python-dotenv>=1.0.1"
+    "python-dotenv>=1.0.1",
+    "pytest>=8.0.0"
 ]
 
 [build-system]

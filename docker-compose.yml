@@ -7,6 +7,10 @@ services:
     image: postgres:16-alpine
     container_name: lakehouse-postgres
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-lakehouse_admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse_secret_change_me}
@@ -27,6 +31,10 @@ services:
     image: rustfs/rustfs:latest
     container_name: lakehouse-storage
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment:
       RUSTFS_VOLUMES: /data
       RUSTFS_ACCESS_KEY: ${S3_ROOT_USER:-lakehouse_storage_admin}
@@ -53,14 +61,24 @@ services:
       dockerfile: Dockerfile
     container_name: lakehouse-worker
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
     environment:
       DATABASE_URI: postgres://${POSTGRES_USER:-lakehouse_admin}:${POSTGRES_PASSWORD:-lakehouse_secret_change_me}@postgres:5432/${POSTGRES_DB:-lakehouse}
       S3_ENDPOINT: http://storage:9000
       S3_ROOT_USER: ${S3_ROOT_USER:-lakehouse_storage_admin}
       S3_ROOT_PASSWORD: ${S3_ROOT_PASSWORD:-storage_secret_change_me}
       S3_BUCKET_NAME: ${S3_BUCKET_NAME:-lakehouse-bucket}
+      S3_REGION: ${S3_REGION:-us-east-1}
     ports:
       - "${WORKER_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       postgres:
         condition: service_healthy
@@ -74,14 +92,27 @@ services:
       dockerfile: Dockerfile
     container_name: lakehouse-web
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
     environment:
       DATABASE_URI: postgres://${POSTGRES_USER:-lakehouse_admin}:${POSTGRES_PASSWORD:-lakehouse_secret_change_me}@postgres:5432/${POSTGRES_DB:-lakehouse}
       PAYLOAD_SECRET: ${PAYLOAD_SECRET:-dev_secret_key_1234567890}
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       WORKER_URL: http://worker:8000
       S3_ENDPOINT: http://storage:9000
+      S3_ROOT_USER: ${S3_ROOT_USER:-lakehouse_storage_admin}
+      S3_ROOT_PASSWORD: ${S3_ROOT_PASSWORD:-storage_secret_change_me}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-lakehouse-bucket}
     ports:
       - "${WEB_PORT:-3000}:3000"
+    labels:
+      - "coolify.managed=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.lakehouse-web.entrypoints=websecure"
+      - "traefik.http.routers.lakehouse-web.tls.certresolver=letsencrypt"
+      - "traefik.http.services.lakehouse-web.loadbalancer.server.port=3000"
     depends_on:
       postgres:
         condition: service_healthy

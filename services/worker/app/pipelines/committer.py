@@ -50,16 +50,25 @@ class DuckLakeCommitter:
         except Exception as e:
             logger.error(f"Failed to attach DuckLake catalog: {e}")
 
-    def commit_table(self, tenant_id: str, table_name: str, relation: duckdb.DuckDBPyRelation, storage_path: str):
+    def commit_table(self, tenant_id: str, table_name: str, relation: duckdb.DuckDBPyRelation, storage_path: str, layer: str = "silver"):
         """
-        Commits cleaned relation to DuckLake under tenant namespace.
+        Commits cleaned relation to DuckLake under tenant schema ({tenant_id}_silver or {tenant_id}_gold).
         """
-        full_table_name = f"{tenant_id}_{table_name}"
-        logger.info(f"Committing table {full_table_name} into {storage_path}")
+        schema_name = f"{tenant_id}_{layer}"
+        qualified_table_name = f"{schema_name}.{table_name}"
+        logger.info(f"Committing table {qualified_table_name} into {storage_path}")
+        
+        # Ensure tenant layer schema exists in catalog / session
+        try:
+            self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name};")
+        except Exception as e:
+            logger.warning(f"Could not create schema {schema_name}: {e}")
+
         # Commits the relation directly to Parquet / DuckLake managed location
         self.conn.register("source_relation", relation)
         create_sql = f"""
-        CREATE TABLE IF NOT EXISTS {full_table_name} AS SELECT * FROM source_relation;
+        CREATE TABLE IF NOT EXISTS {qualified_table_name} AS SELECT * FROM source_relation;
         """
         self.conn.execute(create_sql)
-        logger.info(f"Table {full_table_name} successfully committed.")
+        logger.info(f"Table {qualified_table_name} successfully committed.")
+
