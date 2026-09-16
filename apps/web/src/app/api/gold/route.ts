@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPayload } from 'payload'
-import configPromise from '@/payload.config'
+import configPromise from '@payload-config'
 import { LakehouseQueryService } from '@/services/query-service'
+import { extractTableDependencies } from '@/lib/sql-dependencies'
+import { TenantRepository, DatasetRepository } from '@/repositories'
 
 export async function POST(req: NextRequest) {
   try {
@@ -66,79 +68,29 @@ export async function POST(req: NextRequest) {
 
     // 3. Register or update Gold object in Payload CMS Datasets collection with dependency tracking
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
+    const datasetRepo = new DatasetRepository(payload)
 
-    // Find tenant
-    const tenants = await payload.find({
-      collection: 'tenants',
-      where: { slug: { equals: tenant_id } },
-      limit: 1,
-    })
-
-    let tenantDocId = tenants.docs[0]?.id
-    if (!tenantDocId) {
-      const newTenant = await payload.create({
-        collection: 'tenants',
-        data: { name: tenant_id, slug: tenant_id, active: true },
-      })
-      tenantDocId = newTenant.id
-    }
-
-    // Check if dataset record already exists for this gold object
-    const existing = await payload.find({
-      collection: 'datasets',
-      where: {
-        and: [
-          { tenant: { equals: tenantDocId } },
-          { name: { equals: cleanName } },
-          { layer: { equals: 'gold' } },
-        ],
-      },
-      limit: 1,
-    })
+    const tenantDoc = await tenantRepo.findOrCreateBySlug(tenant_id)
+    const tenantDocId = tenantDoc.id
 
     // Auto-extract dependencies from query if not provided
-    let finalDeps = Array.isArray(dependencies) && dependencies.length > 0 ? [...dependencies] : []
-    if (finalDeps.length === 0 && query) {
-      const matches = query.matchAll(/\b(?:FROM|JOIN)\s+([a-zA-Z0-9_.]+)/gi)
-      const extracted = new Set<string>()
-      for (const m of matches) {
-        const rawTable = m[1].replace(/["`]/g, '')
-        const clean = rawTable.replace(`${tenant_id}_silver.`, '').replace(`${tenant_id}_gold.`, '').replace(`${tenant_id}_`, '')
-        if (clean && clean !== cleanName) {
-          extracted.add(clean)
-        }
-      }
-      finalDeps = Array.from(extracted)
-    }
+    const finalDeps =
+      Array.isArray(dependencies) && dependencies.length > 0
+        ? [...dependencies]
+        : extractTableDependencies(query, tenant_id, cleanName)
 
-    const datasetData = {
+    const dataset = await datasetRepo.createOrUpdateGoldDataset({
       name: cleanName,
-      tenant: tenantDocId,
-      layer: 'gold' as const,
+      tenantDocId,
       objectType: (action === 'materialize' ? 'table' : 'view') as 'table' | 'view',
       sqlQuery: query,
       dependencies: finalDeps,
       format: (action === 'materialize' ? 'parquet' : 'sql_view') as 'parquet' | 'sql_view',
-      status: 'completed' as const,
       ducklakeTable: `${tenant_id}_gold.${cleanName}`,
       rowCount: workerData.row_count ?? 0,
-    }
-
-    let datasetId: string
-    if (existing.docs.length > 0) {
-      const updated = await payload.update({
-        collection: 'datasets',
-        id: existing.docs[0].id,
-        data: datasetData,
-      })
-      datasetId = String(updated.id)
-    } else {
-      const created = await payload.create({
-        collection: 'datasets',
-        data: datasetData,
-      })
-      datasetId = String(created.id)
-    }
+    })
+    const datasetId = String(dataset.id)
 
     return NextResponse.json({
       success: true,
@@ -171,28 +123,13 @@ export async function GET(req: NextRequest) {
     const tenantId = searchParams.get('tenant_id') || 'tenant_acme'
 
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
+    const datasetRepo = new DatasetRepository(payload)
 
-    // Find tenant
-    const tenants = await payload.find({
-      collection: 'tenants',
-      where: { slug: { equals: tenantId } },
-      limit: 1,
-    })
-
-    const tenantDocId = tenants.docs[0]?.id
-
-    // Find Gold datasets for this tenant
-    const datasets = await payload.find({
-      collection: 'datasets',
-      where: {
-        and: [
-          tenantDocId ? { tenant: { equals: tenantDocId } } : { id: { exists: true } },
-          { layer: { equals: 'gold' } },
-        ],
-      },
-      sort: '-updatedAt',
-      limit: 100,
-    })
+    const tenantDoc = await tenantRepo.findBySlug(tenantId)
+    const datasets = tenantDoc
+      ? await datasetRepo.findByTenantId(tenantDoc.id, { layer: 'gold', limit: 100, sort: '-updatedAt' })
+      : []
 
     // Also fetch tables from worker to verify DuckDB schema / catch any direct tables
     const workerUrl = process.env.WORKER_URL || 'http://worker:8000'
@@ -207,20 +144,11 @@ export async function GET(req: NextRequest) {
       console.warn('Worker tables fetch error in GET /api/gold:', e)
     }
 
-    const goldObjects = datasets.docs.map((doc: any) => {
-      let deps: string[] = Array.isArray(doc.dependencies) ? doc.dependencies : []
-      if (deps.length === 0 && doc.sqlQuery) {
-        const matches = doc.sqlQuery.matchAll(/\b(?:FROM|JOIN)\s+([a-zA-Z0-9_.]+)/gi)
-        const extracted = new Set<string>()
-        for (const m of matches) {
-          const rawTable = m[1].replace(/["`]/g, '')
-          const clean = rawTable.replace(`${tenantId}_silver.`, '').replace(`${tenantId}_gold.`, '').replace(`${tenantId}_`, '')
-          if (clean && clean !== doc.name) {
-            extracted.add(clean)
-          }
-        }
-        deps = Array.from(extracted)
-      }
+    const goldObjects = datasets.map((doc: any) => {
+      const deps: string[] =
+        Array.isArray(doc.dependencies) && doc.dependencies.length > 0
+          ? doc.dependencies
+          : extractTableDependencies(doc.sqlQuery || '', tenantId, doc.name)
 
       return {
         id: String(doc.id),

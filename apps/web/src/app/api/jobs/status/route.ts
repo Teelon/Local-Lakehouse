@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPayload } from 'payload'
-import configPromise from '../../../../payload.config'
+import configPromise from '@payload-config'
+import { TenantRepository, DatasetRepository } from '@/repositories'
 
 export async function GET(req: NextRequest) {
   try {
@@ -10,16 +11,12 @@ export async function GET(req: NextRequest) {
     const tenantId = searchParams.get('tenant_id') || 'tenant_acme'
 
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
+    const datasetRepo = new DatasetRepository(payload)
 
     // Resolve tenant document — needed to filter datasets by tenant ID (not slug),
     // which is the correct foreign-key field in the datasets collection.
-    const tenantLookup = await payload.find({
-      collection: 'tenants',
-      where: { slug: { equals: tenantId } },
-      limit: 1,
-    })
-
-    const tenantDoc = tenantLookup.docs[0] ?? null
+    const tenantDoc = await tenantRepo.findBySlug(tenantId)
 
     // Fail-closed guard: if tenant does not resolve (invalid ID, typo, probe),
     // immediately return empty results rather than falling through to an unfiltered query.
@@ -33,15 +30,11 @@ export async function GET(req: NextRequest) {
     }
 
     // Tenant filter is strictly applied in the Payload query before limit applies.
-    const datasetsResult = await payload.find({
-      collection: 'datasets',
-      depth: 1,
-      sort: '-createdAt',
+    const filtered = await datasetRepo.findByTenantId(tenantDoc.id, {
       limit: 20,
-      where: { tenant: { equals: tenantDoc.id } },
+      sort: '-createdAt',
+      depth: 1,
     })
-
-    const filtered = datasetsResult.docs
     const datasetIds = new Set(filtered.map((d: any) => String(d.id)))
 
     // Also fetch payload-jobs if enabled, strictly scoped to this tenant

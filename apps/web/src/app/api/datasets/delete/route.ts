@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPayload } from 'payload'
-import configPromise from '@/payload.config'
+import configPromise from '@payload-config'
+import { TenantRepository, DatasetRepository } from '@/repositories'
 
 export async function POST(req: NextRequest) {
   try {
@@ -24,43 +25,25 @@ export async function POST(req: NextRequest) {
     }
 
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
+    const datasetRepo = new DatasetRepository(payload)
 
     // Resolve the tenant document first — needed both for the scoped query below
     // and for the delete step further down.
-    const tenantLookup = await payload.find({
-      collection: 'tenants',
-      where: { slug: { equals: tenant_id } },
-      limit: 1,
-    })
+    const tenantDoc = await tenantRepo.findBySlug(tenant_id)
 
-    if (tenantLookup.docs.length === 0) {
+    if (!tenantDoc) {
       return NextResponse.json(
         { error: `Tenant '${tenant_id}' not found` },
         { status: 404 }
       )
     }
 
-    const tenantDoc = tenantLookup.docs[0] as any
-
     // 1. Dependency Check before deleting Silver table (or Gold table).
-    // Bug fix: previously queried Gold datasets with no tenant filter (across ALL tenants),
-    // and used depth:0 so doc.tenant was an unpopulated ID — doc.tenant?.slug was always
-    // undefined, meaning the guard docTenant !== tenant_id silently always passed.
-    // Fix: filter by tenant at query time, and use depth:1 to populate tenant.slug.
-    const goldDatasets = await payload.find({
-      collection: 'datasets',
-      depth: 1,
-      where: {
-        and: [
-          { layer: { equals: 'gold' } },
-          { tenant: { equals: tenantDoc.id } },
-        ],
-      },
-      limit: 100,
-    })
+    const goldDatasets = await datasetRepo.findGoldDependents(tenantDoc.id)
 
     const dependentObjects: string[] = []
-    for (const doc of goldDatasets.docs as any[]) {
+    for (const doc of goldDatasets as any[]) {
       // Check explicit dependencies array
       const deps: string[] = Array.isArray(doc.dependencies) ? doc.dependencies : []
       const sql: string = (doc.sqlQuery || '').toLowerCase()
@@ -111,24 +94,9 @@ export async function POST(req: NextRequest) {
     const workerResult = await workerRes.json()
 
     // 3. Delete records in Payload Datasets collection — scoped to this tenant by ID
-    const matchingDatasets = await payload.find({
-      collection: 'datasets',
-      depth: 1,
-      where: {
-        and: [
-          { name: { equals: name } },
-          { layer: { equals: layer } },
-          { tenant: { equals: tenantDoc.id } },
-        ],
-      },
-      limit: 10,
-    })
-
-    for (const doc of matchingDatasets.docs) {
-      await payload.delete({
-        collection: 'datasets',
-        id: doc.id,
-      })
+    const matching = await datasetRepo.findByTenantAndName(tenantDoc.id, name, layer as any)
+    if (matching) {
+      await datasetRepo.delete(matching.id)
     }
 
     return NextResponse.json({

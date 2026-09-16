@@ -1,34 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPayload } from 'payload'
-import configPromise from '@/payload.config'
-
-function formatTenantFriendlyName(slug: string): string {
-  if (slug === 'tenant_acme') return 'Acme Corp (EU-Prod)'
-  if (slug === 'tenant_globex') return 'Globex Corporation'
-  if (slug === 'tenant_a') return 'Tenant Alpha'
-  if (slug === 'tenant_b') return 'Tenant Beta'
-  
-  // Format tenant_foo_bar -> Foo Bar
-  const clean = slug.replace(/^tenant_/, '').replace(/[_-]+/g, ' ').trim()
-  return clean
-    .split(' ')
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ')
-}
+import configPromise from '@payload-config'
+import { TenantRepository } from '@/repositories'
 
 export async function GET() {
   try {
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
     const workerUrl = process.env.WORKER_URL || 'http://worker:8000'
 
     // 1. Fetch tenants currently registered in Payload CMS
-    const payloadTenants = await payload.find({
-      collection: 'tenants',
-      limit: 100,
-      sort: 'name',
-    })
-
-    const existingSlugs = new Set(payloadTenants.docs.map((d: any) => d.slug))
+    const payloadTenants = await tenantRepo.listTenants()
+    const existingSlugs = new Set(payloadTenants.map((d: any) => d.slug))
 
     // 2. Discover tenants from storage via Worker
     try {
@@ -39,18 +22,9 @@ export async function GET() {
 
         for (const slug of storageTenants) {
           if (!existingSlugs.has(slug)) {
-            const name = formatTenantFriendlyName(slug)
             try {
-              const created = await payload.create({
-                collection: 'tenants',
-                data: {
-                  name,
-                  slug,
-                  active: true,
-                  status: 'active',
-                },
-              })
-              payloadTenants.docs.push(created as any)
+              const created = await tenantRepo.findOrCreateBySlug(slug)
+              payloadTenants.push(created as any)
               existingSlugs.add(slug)
             } catch (createErr) {
               console.warn(`Could not auto-register storage tenant ${slug}:`, createErr)
@@ -64,7 +38,7 @@ export async function GET() {
 
     // 3. Count datasets per tenant
     const tenantsWithCounts = await Promise.all(
-      payloadTenants.docs.map(async (doc: any) => {
+      payloadTenants.map(async (doc: any) => {
         let datasetCount = 0
         try {
           const dsCount = await payload.count({
@@ -132,15 +106,12 @@ export async function POST(req: NextRequest) {
     }
 
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
 
     // Check if slug already exists
-    const existing = await payload.find({
-      collection: 'tenants',
-      where: { slug: { equals: cleanSlug } },
-      limit: 1,
-    })
+    const existing = await tenantRepo.findBySlug(cleanSlug)
 
-    if (existing.docs.length > 0) {
+    if (existing) {
       return NextResponse.json(
         { error: `Tenant with identifier '${cleanSlug}' already exists` },
         { status: 409 }

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPayload } from 'payload'
-import configPromise from '@/payload.config'
+import configPromise from '@payload-config'
+import { TenantRepository } from '@/repositories'
 
 export async function POST(req: NextRequest) {
   try {
@@ -19,19 +20,14 @@ export async function POST(req: NextRequest) {
     }
 
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
 
     // Find tenant
-    const tenants = await payload.find({
-      collection: 'tenants',
-      where: { slug: { equals: tenant_slug } },
-      limit: 1,
-    })
+    const tenantDoc = await tenantRepo.findBySlug(tenant_slug)
 
-    if (tenants.docs.length === 0) {
+    if (!tenantDoc) {
       return NextResponse.json({ error: `Tenant '${tenant_slug}' not found` }, { status: 404 })
     }
-
-    const tenantDoc = tenants.docs[0]
 
     // Action 1: Deactivate (Synchronous STS revocation + inactive flag)
     if (action === 'deactivate') {

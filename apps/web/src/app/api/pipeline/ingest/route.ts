@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
+import { PutObjectCommand } from '@aws-sdk/client-s3'
 import { getPayload } from 'payload'
-import configPromise from '../../../../payload.config'
-import { getTenantScopedCredentials } from '@/lib/s3-credentials'
+import configPromise from '@payload-config'
+import { S3ClientFactory } from '@/lib/s3-client-factory'
+import { TenantRepository, DatasetRepository } from '@/repositories'
 
 export async function POST(req: NextRequest) {
   try {
@@ -38,26 +39,10 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
 
-    // 1. Obtain tenant-scoped temporary S3 credentials via STS.
-    // Previously this used root credentials (S3_ROOT_USER/S3_ROOT_PASSWORD) directly,
-    // bypassing the tenant-scoped credential system that already existed in /api/auth/sts.
+    // 1. Obtain tenant-scoped temporary S3 client via S3ClientFactory.
     // STS scoping ensures uploads can only land under tenants/{tenantId}/* in the bucket.
-    const scopedCreds = await getTenantScopedCredentials(tenantId)
-
-    const s3Endpoint = process.env.S3_ENDPOINT || 'http://storage:9000'
+    const s3Client = await S3ClientFactory.createTenantS3Client(tenantId)
     const bucket = process.env.S3_BUCKET_NAME || 'lakehouse-bucket'
-    const region = process.env.S3_REGION || 'us-east-1'
-
-    const s3Client = new S3Client({
-      endpoint: s3Endpoint,
-      region,
-      forcePathStyle: true,
-      credentials: {
-        accessKeyId: scopedCreds.accessKeyId,
-        secretAccessKey: scopedCreds.secretAccessKey,
-        ...(scopedCreds.sessionToken ? { sessionToken: scopedCreds.sessionToken } : {}),
-      },
-    })
 
     const rawKey = `tenants/${tenantId}/raw/${Date.now()}_${filename}`
     await s3Client.send(
@@ -73,26 +58,10 @@ export async function POST(req: NextRequest) {
 
     // 2. Initialize Payload and ensure tenant exists
     const payload = await getPayload({ config: configPromise })
+    const tenantRepo = new TenantRepository(payload)
+    const datasetRepo = new DatasetRepository(payload)
 
-    let tenantDoc = null
-    const existingTenants = await payload.find({
-      collection: 'tenants',
-      where: { slug: { equals: tenantId } },
-      limit: 1,
-    })
-
-    if (existingTenants.docs.length > 0) {
-      tenantDoc = existingTenants.docs[0]
-    } else {
-      tenantDoc = await payload.create({
-        collection: 'tenants',
-        data: {
-          name: tenantId.replace('_', ' ').toUpperCase(),
-          slug: tenantId,
-          active: true,
-        },
-      })
-    }
+    const tenantDoc = await tenantRepo.findOrCreateBySlug(tenantId)
 
     // Determine format
     let format: 'csv' | 'json' | 'parquet' = 'csv'
@@ -100,18 +69,12 @@ export async function POST(req: NextRequest) {
     else if (filename.endsWith('.json') || filename.endsWith('.ndjson')) format = 'json'
 
     // 3. Create Dataset in Payload with status 'uploaded' -> fires afterChange hook to enqueue ingest-file job
-    const dataset = await payload.create({
-      collection: 'datasets',
-      data: {
-        name: tableName,
-        tenant: tenantDoc.id,
-        rawFilePath: rawKey,
-        format,
-        layer: 'silver',
-        objectType: 'table',
-        status: 'uploaded',
-        ducklakeTable: `${tenantId}_silver.${tableName}`,
-      },
+    const dataset = await datasetRepo.createSilverDataset({
+      name: tableName,
+      tenantDocId: tenantDoc.id,
+      rawFilePath: rawKey,
+      format,
+      ducklakeTable: `${tenantId}_silver.${tableName}`,
     })
 
     return NextResponse.json({

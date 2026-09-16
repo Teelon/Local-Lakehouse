@@ -203,15 +203,25 @@ class DuckLakeCommitter:
         # Register the cleaned relation on this connection and commit it to DuckLake.
         # DuckLake's CREATE OR REPLACE TABLE writes Parquet to DATA_PATH and records
         # the transaction in the PostgreSQL catalog — this is the atomic commit.
+        existing_tables = self.list_tables(tenant_id, layer)
         self.conn.register("_committer_source", relation)
         try:
-            self.conn.execute(
-                f"CREATE OR REPLACE TABLE {qualified_name} AS SELECT * FROM _committer_source;"
-            )
-            logger.info(
-                f"DuckLake commit successful: {qualified_name} "
-                f"(catalog: {self.catalog_schema})"
-            )
+            if table_name in existing_tables:
+                self.conn.execute(
+                    f"INSERT INTO {qualified_name} SELECT * FROM _committer_source;"
+                )
+                logger.info(
+                    f"DuckLake append successful: {qualified_name} "
+                    f"(catalog: {self.catalog_schema})"
+                )
+            else:
+                self.conn.execute(
+                    f"CREATE TABLE {qualified_name} AS SELECT * FROM _committer_source;"
+                )
+                logger.info(
+                    f"DuckLake commit successful: {qualified_name} "
+                    f"(catalog: {self.catalog_schema})"
+                )
         finally:
             try:
                 self.conn.unregister("_committer_source")

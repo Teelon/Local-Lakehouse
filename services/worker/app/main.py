@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 
 from app.pipelines.cleaner import IngestionCleaner
 from app.pipelines.committer import DuckLakeCommitter
+from app.engine import LakehouseEngine
+from app.s3_factory import S3ClientFactory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("lakehouse-worker")
@@ -39,13 +41,8 @@ DUCKLAKE_DATA_PATH = f"s3://{S3_BUCKET}/ducklake/"
 # Module-level clients
 # ---------------------------------------------------------------------------
 
-s3_client = boto3.client(
-    "s3",
-    endpoint_url=S3_ENDPOINT,
-    aws_access_key_id=S3_ACCESS_KEY,
-    aws_secret_access_key=S3_SECRET_KEY,
-    region_name=S3_REGION,
-)
+s3_admin = S3ClientFactory.create_admin_client()
+s3_client = s3_admin
 
 # ---------------------------------------------------------------------------
 # DuckDB connections
@@ -76,6 +73,9 @@ con.execute("SET memory_limit='512MB';")
 # Module-level DuckLakeCommitter — initialized in lifespan, used by ingest handlers.
 _committer: Optional[DuckLakeCommitter] = None
 _ducklake_active: bool = False
+
+# Centralized LakehouseEngine facade
+engine = LakehouseEngine(con=con, s3_client=s3_admin)
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +165,7 @@ def _init_ducklake() -> bool:
         committer.attach_catalog(data_path=DUCKLAKE_DATA_PATH)
         _committer = committer
         _ducklake_active = True
+        engine.set_committer(committer)
         logger.info(
             f"DuckLake ACTIVE. Catalog attached. Data path: {DUCKLAKE_DATA_PATH}"
         )
@@ -316,57 +317,14 @@ def sync_all_tables_from_storage():
 # Shared ingest commit function (single source of truth for both ingest paths)
 # ---------------------------------------------------------------------------
 
-def _commit_to_ducklake(
+async def _commit_to_ducklake(
     tenant_id: str,
     table_name: str,
     relation: duckdb.DuckDBPyRelation,
     layer: str = "silver",
 ) -> str:
-    """
-    Commits a cleaned DuckDB relation to a DuckLake-managed table.
-    This is the single implementation called by both ingest paths
-    (ingest_job and upload_and_commit) to avoid divergence.
-
-    Returns the fully-qualified DuckLake table name.
-    Raises RuntimeError if DuckLake is not active.
-    """
-    if not _ducklake_active or _committer is None:
-        raise RuntimeError(
-            "DuckLake is not active. Cannot commit table. "
-            "Check startup logs for DuckLake initialization errors."
-        )
-
-    _committer.commit_table(
-        tenant_id=tenant_id,
-        table_name=table_name,
-        relation=relation,
-        layer=layer,
-    )
-
-    # After committing, register a view on the shared read connection
-    # so the table is immediately queryable via SQL Studio without a restart.
-    qualified_name = f"{tenant_id}_{layer}.{table_name}"
-    catalog_qualified = (
-        f"{DuckLakeCommitter.CATALOG_ALIAS}.{tenant_id}_{layer}.{table_name}"
-    )
-    try:
-        ensure_tenant_schemas(tenant_id, con)
-        con.execute(
-            f"CREATE OR REPLACE VIEW {qualified_name} AS "
-            f"SELECT * FROM {catalog_qualified};"
-        )
-        # Legacy flat-name alias for silver tables
-        if layer == "silver":
-            legacy_name = f"{tenant_id}_{table_name}"
-            con.execute(
-                f"CREATE OR REPLACE VIEW {legacy_name} AS SELECT * FROM {qualified_name};"
-            )
-    except Exception as ex:
-        logger.warning(
-            f"DuckLake commit succeeded but view registration on query connection failed: {ex}"
-        )
-
-    return qualified_name
+    """Delegates to LakehouseEngine.commit_table with write-lock protection."""
+    return await engine.commit_table(tenant_id, table_name, relation, layer)
 
 
 # ---------------------------------------------------------------------------
@@ -376,16 +334,18 @@ def _commit_to_ducklake(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_s3_bucket()
-    configure_duckdb_s3(con)
     ducklake_ok = _init_ducklake()
     if ducklake_ok:
         logger.info("DuckLake initialization successful. Syncing existing tables from catalog.")
+        if _committer:
+            engine.set_committer(_committer)
     else:
         logger.warning(
             "DuckLake initialization FAILED. "
             "Falling back to S3-scan table registration for existing data. "
             "New ingest operations will fail until DuckLake is fixed."
         )
+    engine.prepare_for_read("tenant_acme")
     sync_all_tables_from_storage()
     yield
 
@@ -463,7 +423,7 @@ async def ingest_job(req: IngestJobRequest):
     try:
         start_time = time.time()
         init_s3_bucket()
-        configure_duckdb_s3(con)
+        engine.prepare_for_write(req.tenant_id)
 
         # Normalize raw path
         raw_path = req.file_path.strip()
@@ -488,8 +448,8 @@ async def ingest_job(req: IngestJobRequest):
         else:
             rel = IngestionCleaner.process_csv(raw_s3_uri, con)
 
-        # Commit to DuckLake (single source of truth — shared with upload_and_commit)
-        qualified_name = _commit_to_ducklake(req.tenant_id, req.table_name, rel, "silver")
+        # Commit to DuckLake via LakehouseEngine write-lock
+        qualified_name = await engine.commit_table(req.tenant_id, req.table_name, rel, "silver")
         logger.info(f"[Job {req.job_id}] DuckLake commit complete: {qualified_name}")
 
         row_count = con.execute(f"SELECT COUNT(*) FROM {qualified_name}").fetchone()[0]
@@ -594,34 +554,23 @@ async def upload_and_commit(
 @app.post("/api/v1/gold/view")
 async def create_gold_view(req: CreateGoldViewRequest):
     """
-    Creates or replaces a Gold SQL view:
-    CREATE VIEW {tenant_id}_gold.{view_name} AS {query}
-    Gold views are metadata-only (no Parquet storage) and evaluated live.
+    Creates or replaces a Gold SQL view under LakehouseEngine write lock.
     """
     try:
-        configure_duckdb_s3(con)
-        ensure_tenant_schemas(req.tenant_id, con)
-        sync_tenant_tables(req.tenant_id)
+        engine.prepare_for_write(req.tenant_id)
+        engine.sync_tenant_tables(req.tenant_id)
 
-        clean_view_name = req.view_name.strip().replace('"', '').replace("'", "")
-        qualified_name = f"{req.tenant_id}_gold.{clean_view_name}"
-
-        sql_stmt = f"CREATE OR REPLACE VIEW {qualified_name} AS {req.query.strip().rstrip(';')};"
-        con.execute(sql_stmt)
-        logger.info(f"Created Gold view: {qualified_name}")
-
-        columns_info = con.execute(f"PRAGMA table_info('{qualified_name}')").fetchall()
-        col_names = [col[1] for col in columns_info]
+        view_data = await engine.create_gold_view(req.tenant_id, req.view_name, req.query)
 
         return {
             "success": True,
             "tenant_id": req.tenant_id,
-            "name": clean_view_name,
-            "full_name": qualified_name,
-            "layer": "gold",
-            "object_type": "view",
-            "columns": col_names,
-            "message": f"Gold view '{qualified_name}' successfully created.",
+            "name": view_data["name"],
+            "full_name": view_data["full_name"],
+            "layer": view_data["layer"],
+            "object_type": view_data["object_type"],
+            "columns": view_data["columns"],
+            "message": f"Gold view '{view_data['full_name']}' successfully created.",
         }
     except Exception as e:
         logger.exception(f"Failed to create Gold view {req.view_name}")
@@ -631,35 +580,24 @@ async def create_gold_view(req: CreateGoldViewRequest):
 @app.post("/api/v1/gold/materialize")
 async def materialize_gold_table(req: MaterializeGoldTableRequest):
     """
-    Materializes a Gold table (explicit opt-in escape hatch):
-    Commits the query result as a DuckLake-managed table under
-    {tenant_id}_gold.{table_name}.
+    Materializes a Gold table via LakehouseEngine write-lock commit.
     """
     try:
-        configure_duckdb_s3(con)
-        sync_tenant_tables(req.tenant_id)
+        engine.prepare_for_write(req.tenant_id)
+        engine.sync_tenant_tables(req.tenant_id)
 
-        clean_table_name = req.table_name.strip().replace('"', '').replace("'", "")
-
-        # Execute the query to get the relation, then commit to DuckLake Gold schema
-        rel = con.sql(req.query.strip().rstrip(";"))
-        qualified_name = _commit_to_ducklake(req.tenant_id, clean_table_name, rel, "gold")
-        logger.info(f"Materialized Gold table via DuckLake: {qualified_name}")
-
-        row_count = con.execute(f"SELECT COUNT(*) FROM {qualified_name}").fetchone()[0]
-        columns_info = con.execute(f"PRAGMA table_info('{qualified_name}')").fetchall()
-        col_names = [col[1] for col in columns_info]
+        mat_data = await engine.materialize_gold_table(req.tenant_id, req.table_name, req.query)
 
         return {
             "success": True,
             "tenant_id": req.tenant_id,
-            "name": clean_table_name,
-            "full_name": qualified_name,
-            "layer": "gold",
-            "object_type": "table",
-            "row_count": row_count,
-            "columns": col_names,
-            "message": f"Gold table '{qualified_name}' successfully materialized ({row_count} rows) via DuckLake.",
+            "name": mat_data["name"],
+            "full_name": mat_data["full_name"],
+            "layer": mat_data["layer"],
+            "object_type": mat_data["object_type"],
+            "row_count": mat_data["row_count"],
+            "columns": mat_data["columns"],
+            "message": f"Gold table '{mat_data['full_name']}' successfully materialized ({mat_data['row_count']} rows) via DuckLake.",
         }
     except Exception as e:
         logger.exception(f"Failed to materialize Gold table {req.table_name}")
@@ -676,33 +614,28 @@ async def delete_dataset(req: DeleteDatasetRequest):
        - Purge the corresponding RustFS prefix
     """
     try:
-        configure_duckdb_s3(con)
+        engine.prepare_for_delete(req.tenant_id)
         layer = req.layer.lower()
         schema_name = f"{req.tenant_id}_{layer}"
         qualified_name = f"{schema_name}.{req.name}"
 
-        # 1. Drop catalog entry from read connection
-        try:
-            con.execute(f"DROP VIEW IF EXISTS {qualified_name};")
-            con.execute(f"DROP TABLE IF EXISTS {qualified_name};")
-            if layer == "silver":
-                con.execute(f"DROP VIEW IF EXISTS {req.tenant_id}_{req.name};")
-        except Exception as e:
-            logger.warning(f"Drop catalog warning: {e}")
+        # 1. Drop catalog entry from read connection under lock
+        await engine.drop_dataset(req.tenant_id, req.name, layer, req.object_type)
 
-        # 2. Purge RustFS storage if table (not a view)
+        # 2. Purge RustFS storage using tenant-scoped STS client
         storage_deleted = False
         if req.object_type != "view":
             prefix = f"tenants/{req.tenant_id}/{'tables' if layer == 'silver' else 'gold'}/{req.name}/"
             logger.info(f"Deleting storage objects under prefix: {prefix}")
             try:
-                paginator = s3_client.get_paginator("list_objects_v2")
+                tenant_s3 = S3ClientFactory.create_tenant_client(req.tenant_id)
+                paginator = tenant_s3.get_paginator("list_objects_v2")
                 pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix)
                 for page in pages:
                     if "Contents" in page:
                         delete_keys = [{"Key": obj["Key"]} for obj in page["Contents"]]
                         if delete_keys:
-                            s3_client.delete_objects(
+                            tenant_s3.delete_objects(
                                 Bucket=S3_BUCKET, Delete={"Objects": delete_keys}
                             )
                             storage_deleted = True
@@ -778,41 +711,25 @@ async def hard_delete_tenant(req: HardDeleteTenantRequest):
     """
     steps_completed = []
     try:
-        configure_duckdb_s3(con)
+        engine.prepare_for_delete(req.tenant_id)
         tid = req.tenant_id
 
-        # Step 1: Drop Gold schema
-        try:
-            con.execute(f"DROP SCHEMA IF EXISTS {tid}_gold CASCADE;")
-            steps_completed.append("drop_gold_schema")
-        except Exception as e:
-            logger.warning(f"Failed to drop gold schema {tid}_gold: {e}")
+        # Step 1 & 2: Drop schemas and legacy views under write lock
+        await engine.drop_tenant_schemas(tid)
+        steps_completed.append("drop_schemas")
 
-        # Step 2: Drop Silver schema and legacy aliases
-        try:
-            con.execute(f"DROP SCHEMA IF EXISTS {tid}_silver CASCADE;")
-            tables = [
-                t[0]
-                for t in con.execute("SHOW TABLES;").fetchall()
-                if t[0].startswith(f"{tid}_")
-            ]
-            for t in tables:
-                con.execute(f"DROP VIEW IF EXISTS {t};")
-            steps_completed.append("drop_silver_schema")
-        except Exception as e:
-            logger.warning(f"Failed to drop silver schema {tid}_silver: {e}")
-
-        # Step 3: Purge entire RustFS prefix tenants/{tenant_id}/*
+        # Step 3: Purge entire RustFS prefix tenants/{tenant_id}/* using tenant-scoped STS client
         tenant_prefix = f"tenants/{tid}/"
         logger.info(f"Purging all RustFS objects under {tenant_prefix}...")
         try:
-            paginator = s3_client.get_paginator("list_objects_v2")
+            tenant_s3 = S3ClientFactory.create_tenant_client(tid)
+            paginator = tenant_s3.get_paginator("list_objects_v2")
             pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=tenant_prefix)
             for page in pages:
                 if "Contents" in page:
                     delete_keys = [{"Key": obj["Key"]} for obj in page["Contents"]]
                     if delete_keys:
-                        s3_client.delete_objects(
+                        tenant_s3.delete_objects(
                             Bucket=S3_BUCKET, Delete={"Objects": delete_keys}
                         )
             steps_completed.append("purge_storage_prefix")
@@ -845,83 +762,19 @@ async def list_tables(tenant_id: Optional[str] = None):
     Uses DuckLake catalog as primary source when active; S3 scan as fallback.
     """
     try:
-        configure_duckdb_s3(con)
         if tenant_id:
-            sync_tenant_tables(tenant_id)
+            engine.prepare_for_read(tenant_id)
         else:
             sync_all_tables_from_storage()
 
-        schema_query = """
-        SELECT table_schema, table_name, table_type 
-        FROM information_schema.tables 
-        WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'temp')
-        """
-        all_objs = con.execute(schema_query).fetchall()
-
-        tables_data = []
-        for row in all_objs:
-            schema, name, tbl_type = row[0], row[1], row[2]
-            if name == "temp_clean_source" or name == "_committer_source":
-                continue
-
-            layer = "silver"
-            obj_type = "view" if "VIEW" in (tbl_type or "").upper() else "table"
-
-            if tenant_id:
-                if schema == f"{tenant_id}_silver":
-                    layer = "silver"
-                elif schema == f"{tenant_id}_gold":
-                    layer = "gold"
-                elif schema == "main" and name.startswith(f"{tenant_id}_"):
-                    layer = "silver"
-                else:
-                    continue
-            else:
-                if "_silver" in schema:
-                    layer = "silver"
-                elif "_gold" in schema:
-                    layer = "gold"
-
-            if schema == "main":
-                qualified_name = name
-                display_name = (
-                    name[len(tenant_id) + 1 :]
-                    if (tenant_id and name.startswith(f"{tenant_id}_"))
-                    else name
-                )
-            else:
-                qualified_name = f"{schema}.{name}"
-                display_name = name
-
-            try:
-                info = con.execute(f"PRAGMA table_info('{qualified_name}');").fetchall()
-                cols = [{"name": c[1], "type": c[2]} for c in info]
-            except Exception:
-                cols = []
-
-            tables_data.append(
-                {
-                    "name": display_name,
-                    "full_name": qualified_name,
-                    "schema": schema,
-                    "layer": layer,
-                    "type": obj_type,
-                    "columns": cols,
-                }
-            )
-
-        # Deduplicate (qualified and legacy names may both appear)
-        unique_tables = []
-        seen = set()
-        for t in tables_data:
-            key = (t["layer"], t["name"])
-            if key not in seen:
-                seen.add(key)
-                unique_tables.append(t)
-
-        return {"tenant_id": tenant_id, "tables": unique_tables}
+        unique_tables = engine.list_tables(tenant_id)
+        return {
+            "tenant_id": tenant_id,
+            "tables": unique_tables,
+            "count": len(unique_tables),
+        }
     except Exception as e:
-        logger.exception("Failed to list tables")
+        logger.exception(f"Failed to list tables for tenant {tenant_id}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -954,14 +807,12 @@ async def run_query(request: Request):
         if not sql_query.strip():
             raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-        configure_duckdb_s3(con)
         if tenant_id:
-            sync_tenant_tables(tenant_id)
+            engine.prepare_for_read(tenant_id)
+        else:
+            engine._ensure_s3_configured()
 
-        rel = con.sql(sql_query)
-        columns = rel.columns
-        rows = [list(r) for r in rel.fetchall()]
-        return {"columns": columns, "rows": rows, "row_count": len(rows)}
+        return engine.run_query(sql_query)
     except HTTPException:
         raise
     except Exception as e:

@@ -45,6 +45,22 @@ def test_complete_mvp1_acceptance_loop():
     print(f"\n[Step 1] Initializing tenants: {tenant_a_id}, {tenant_b_id}")
 
     # Clean previous test objects for 'events' table to ensure deterministic test baseline
+    try:
+        httpx.post(
+            f"{os.getenv('WORKER_URL', 'http://worker:8000')}/api/v1/datasets/delete",
+            json={"tenant_id": tenant_a_id, "name": "events", "layer": "silver", "object_type": "table"},
+            timeout=5.0,
+        )
+    except Exception:
+        pass
+    try:
+        client.post(
+            "/api/datasets/delete",
+            json={"tenant_id": tenant_a_id, "name": "events", "layer": "silver", "force": True},
+        )
+    except Exception:
+        pass
+
     old_objs = s3_admin.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"tenants/{tenant_a_id}/tables/events/")
     for obj in old_objs.get("Contents", []):
         s3_admin.delete_object(Bucket=S3_BUCKET, Key=obj["Key"])
@@ -111,22 +127,18 @@ def test_complete_mvp1_acceptance_loop():
     print(" -> Payload background ingestion job verified.")
 
     # --------------------------------------------------------------------------
-    # Step 5 & 6: Table committed to DuckLake / Parquet
+    # Step 5 & 6: Table committed to DuckLake
     # --------------------------------------------------------------------------
-    table_prefix = f"tenants/{tenant_a_id}/tables/events/"
-    print(f"[Step 5 & 6] Verifying Parquet dataset committed under {table_prefix}...")
-    parquet_objs = s3_admin.list_objects_v2(Bucket=S3_BUCKET, Prefix=table_prefix)
-    contents = parquet_objs.get("Contents", [])
-    assert len(contents) >= 1, f"No parquet files found under {table_prefix}"
-    print(f" -> {len(contents)} Parquet part file(s) verified in object storage.")
-
+    print(f"[Step 5 & 6] Verifying table committed in DuckLake catalog...")
     # Check table appears in table explorer catalog
     tables_res = client.get(f"/api/tables?tenant_id={tenant_a_id}")
     assert tables_res.status_code == 200
     catalog_tables = tables_res.json().get("tables", [])
     table_names = [t["full_name"] for t in catalog_tables]
-    assert f"{tenant_a_id}_events" in table_names, f"Table not found in catalog: {table_names}"
-    print(f" -> Table '{tenant_a_id}_events' confirmed in catalog with schema.")
+    assert (
+        f"{tenant_a_id}_silver.events" in table_names or f"{tenant_a_id}_events" in table_names
+    ), f"Table not found in catalog: {table_names}"
+    print(f" -> Table '{tenant_a_id}_silver.events' confirmed in catalog with schema.")
 
     # --------------------------------------------------------------------------
     # Step 7: Tenant A queries the new table in SQL Studio

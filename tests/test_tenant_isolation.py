@@ -211,12 +211,18 @@ def test_5_2_query_isolation_rejects_cross_tenant_table_access(seed_tenants_stor
         files={"file": ("customers.csv", b"id,name\n1,Acme Inc\n2,Acme Direct\n", "text/csv")},
     )
 
-    # 5. Legitimate query for own tenant succeeds
-    res_legit = client.post(
-        "/api/query",
-        json={"query": "SELECT * FROM tenant_acme_silver.customers LIMIT 2", "tenant_id": "tenant_acme"},
-    )
-    assert res_legit.status_code == 200, f"Legitimate query failed: {res_legit.text}"
+    # 5. Legitimate query for own tenant succeeds (poll briefly for async job completion)
+    res_legit = None
+    for _ in range(15):
+        res_legit = client.post(
+            "/api/query",
+            json={"query": "SELECT * FROM tenant_acme_silver.customers LIMIT 2", "tenant_id": "tenant_acme"},
+        )
+        if res_legit.status_code == 200:
+            break
+        time.sleep(1)
+
+    assert res_legit is not None and res_legit.status_code == 200, f"Legitimate query failed: {res_legit.text if res_legit else 'No response'}"
     legit_data = res_legit.json()
     assert "columns" in legit_data
     assert "rows" in legit_data
